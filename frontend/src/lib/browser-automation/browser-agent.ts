@@ -1,0 +1,351 @@
+import { DOMDetector } from "./dom-detector";
+import { ActionExecutor } from "./action-executor";
+import api from "@/lib/api";
+
+export interface BrowserAgentConfig {
+  maxIterations?: number;
+  waitAfterAction?: number; // ms to wait after each action
+}
+
+export interface AgentStep {
+  iteration: number;
+  action: string;
+  result: string;
+  elementsCount?: number;
+}
+
+export interface AgentResult {
+  success: boolean;
+  message: string;
+  steps: AgentStep[];
+}
+
+export class BrowserAgent {
+  private detector: DOMDetector;
+  private executor: ActionExecutor;
+  private config: Required<BrowserAgentConfig>;
+  private steps: AgentStep[] = [];
+  private conversationHistory: Array<{ role: string; content: string }> = [];
+  private aborted: boolean = false;
+
+  constructor(config?: BrowserAgentConfig) {
+    this.detector = new DOMDetector();
+    this.executor = new ActionExecutor();
+    this.config = {
+      maxIterations: config?.maxIterations || 20,
+      waitAfterAction: config?.waitAfterAction || 500,
+    };
+  }
+
+  public async executeTask(
+    task: string,
+    onProgress?: (step: AgentStep) => void,
+    onStatusChange?: (status: string) => void
+  ): Promise<AgentResult> {
+    this.steps = [];
+    this.aborted = false;
+
+    for (let i = 0; i < this.config.maxIterations; i++) {
+      if (this.aborted) {
+        return {
+          success: false,
+          message: "Stopped by user",
+          steps: this.steps,
+        };
+      }
+      try {
+        // Thinking phase
+        if (onStatusChange) onStatusChange("thinking");
+
+        const detectionResult = this.detector.detectElements();
+
+        const llmResponse = await this.callLLM(
+          task,
+          detectionResult.pseudoHtml,
+          i === 0 // isFirstIteration
+        );
+
+        const parsedAction = this.parseAction(llmResponse);
+
+        if (!parsedAction) {
+          const step: AgentStep = {
+            iteration: i + 1,
+            action: "done",
+            result: llmResponse,
+            elementsCount: detectionResult.totalCount,
+          };
+          this.steps.push(step);
+          if (onProgress) onProgress(step);
+
+          return {
+            success: true,
+            message: llmResponse,
+            steps: this.steps,
+          };
+        }
+
+        // Action phase - show what's being done
+        if (onStatusChange) {
+          const actionLabel = this.getActionLabel(parsedAction);
+          onStatusChange(actionLabel);
+        }
+
+        //  Execute the action
+        const actionResult = await this.executeAction(parsedAction, this.detector);
+
+        // Record step
+        const step: AgentStep = {
+          iteration: i + 1,
+          action: `${parsedAction.type}(${parsedAction.params.join(", ")})`,
+          result: actionResult.message,
+          elementsCount: detectionResult.totalCount,
+        };
+        this.steps.push(step);
+        if (onProgress) onProgress(step);
+
+        if (!actionResult.success) {
+          // Action failed - add this to conversation history so LLM knows
+          this.conversationHistory.push({
+            role: "user",
+            content: `Action failed: ${parsedAction.type}(${parsedAction.params.join(", ")}) - ${actionResult.message}`,
+          });
+          return {
+            success: false,
+            message: `Action failed: ${actionResult.message}`,
+            steps: this.steps,
+          };
+        }
+
+        // Add action result to conversation history so LLM knows what was done
+        this.conversationHistory.push({
+          role: "user",
+          content: `Action completed: ${parsedAction.type}(${parsedAction.params.join(", ")}) - ${actionResult.message}`,
+        });
+
+        // Wait for page to settle after action
+        await this.wait(this.config.waitAfterAction);
+      } catch (error) {
+        console.error("Error in ReAct loop:", error);
+        return {
+          success: false,
+          message: `Error: ${(error as Error).message}`,
+          steps: this.steps,
+        };
+      }
+    }
+
+    // Max iterations reached
+    return {
+      success: false,
+      message: `Max iterations (${this.config.maxIterations}) reached without completing task`,
+      steps: this.steps,
+    };
+  }
+
+  //Call LLM via backend with conversation history
+  private async callLLM(
+    task: string,
+    elementsHtml: string,
+    isFirstIteration: boolean
+  ): Promise<string> {
+    try {
+      // Build user message
+      let userMessage: string;
+      const currentUrl = window.location.href;
+
+      if (isFirstIteration) {
+        userMessage = `Task: ${task}\n\nCurrent URL: ${currentUrl}\n\nAvailable elements:\n${elementsHtml}`;
+      } else {
+        userMessage = `Current URL: ${currentUrl}\n\nAvailable elements:\n${elementsHtml}`;
+      }
+
+      this.conversationHistory.push({
+        role: "user",
+        content: userMessage,
+      });
+
+      const cleanHistory = this.conversationHistory
+        .slice(0, -1)
+        .filter((entry) => entry.content && entry.content.trim() !== "");
+
+      const response = await api.post("/ai-chat/chat", {
+        message: userMessage,
+        history: cleanHistory,
+      });
+
+      const data = response.data;
+      // Check for API-level errors (e.g. invalid API key, rate limit)
+      if (data?.success === false || (data?.error && !data?.message)) {
+        const errMsg = data?.error || data?.message || "Chat request failed";
+        console.error("AI Chat API error:", errMsg);
+        throw new Error(errMsg);
+      }
+      const llmResponse = data?.message || "";
+
+      this.conversationHistory.push({
+        role: "assistant",
+        content: llmResponse.trim() || "[empty response]",
+      });
+
+      return llmResponse;
+    } catch (error: any) {
+      const msg = error?.response?.data?.message || error?.response?.data?.error || error?.message || "Unknown error";
+      return `DONE: ${msg}`;
+    }
+  }
+
+  //Parse LLM response to extract action
+
+  private parseAction(response: string): { type: string; params: any[] } | null {
+    const trimmed = response.trim();
+
+    // Check for DONE
+    if (trimmed.startsWith("DONE:") || trimmed.toLowerCase().includes("task complete")) {
+      return null;
+    }
+
+    // Check for ACTION: format
+    const actionMatch = trimmed.match(/ACTION:\s*(\w+)\(([^)]*)\)/i);
+    if (actionMatch) {
+      const actionType = actionMatch[1].toLowerCase();
+      const paramsStr = actionMatch[2].trim();
+      const params: any[] = [];
+
+      if (paramsStr) {
+        const paramMatches = paramsStr.match(/(?:[^,"]+|"[^"]*")+/g) || [];
+        for (const param of paramMatches) {
+          const trimmedParam = param.trim();
+          if (trimmedParam.startsWith('"') && trimmedParam.endsWith('"')) {
+            params.push(trimmedParam.slice(1, -1));
+          } else {
+            const num = parseInt(trimmedParam, 10);
+            params.push(isNaN(num) ? trimmedParam : num);
+          }
+        }
+      }
+
+      return { type: actionType, params };
+    }
+    const cmdMatch = trimmed.match(/\[COMMAND:\s*(\w+)\]\s*(\{[\s\S]*?\})/i);
+    if (cmdMatch) {
+      const actionType = cmdMatch[1].toLowerCase();
+      try {
+        const json = JSON.parse(cmdMatch[2]);
+        const params: any[] = [];
+
+        if (json.selector) {
+          const el = document.querySelector(json.selector);
+          if (el) {
+            const idx = this.detector.findIndexByElement(el);
+            if (idx !== null) params.push(idx);
+          }
+        }
+
+        if (params.length === 0 && json.element !== undefined) params.push(json.element);
+        if (params.length === 0 && json.index !== undefined) params.push(json.index);
+
+        if (json.text !== undefined) params.push(json.text);
+        if (json.value !== undefined && json.text === undefined) params.push(json.value);
+        if (json.direction !== undefined) params.push(json.direction);
+        if (json.option !== undefined) params.push(json.option);
+
+        if (params.length > 0) {
+          return { type: actionType, params };
+        }
+      } catch {
+        console.warn("Failed to parse JSON in command action");
+      }
+    }
+    return null;
+  }
+
+
+  private async executeAction(
+    action: { type: string; params: any[] },
+    detector: DOMDetector
+  ): Promise<{ success: boolean; message: string }> {
+    const { type, params } = action;
+
+    switch (type) {
+      case "click":
+        if (params.length < 1) {
+          return { success: false, message: "click requires an index parameter" };
+        }
+        return await this.executor.clickElement(params[0], { detector });
+
+      case "type":
+        if (params.length < 2) {
+          return { success: false, message: "type requires index and text parameters" };
+        }
+        return await this.executor.inputText(params[0], params[1], { detector });
+
+      case "scroll":
+        if (params.length < 1) {
+          return { success: false, message: "scroll requires a direction parameter" };
+        }
+        const direction = params[0].toLowerCase();
+        if (direction !== "up" && direction !== "down") {
+          return { success: false, message: 'scroll direction must be "up" or "down"' };
+        }
+        return await this.executor.scroll(direction as "up" | "down");
+
+      case "select":
+        if (params.length < 2) {
+          return { success: false, message: "select requires index and option parameters" };
+        }
+        return await this.executor.selectOption(params[0], params[1], { detector });
+
+      default:
+        return { success: false, message: `Unknown action type: ${type}` };
+    }
+  }
+
+
+  private wait(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+
+  public getSteps(): AgentStep[] {
+    return this.steps;
+  }
+
+  private getActionLabel(parsedAction: { type: string; params: any[] }): string {
+    switch (parsedAction.type) {
+      case "click":
+        return "Clicking element";
+      case "type":
+        return `Typing "${parsedAction.params[1]?.toString().substring(0, 30) || ""}"`;
+      case "scroll":
+        return `Scrolling ${parsedAction.params[0] || "down"}`;
+      case "select":
+        return `Selecting "${parsedAction.params[1] || ""}"`;
+      default:
+        return "Performing action";
+    }
+  }
+
+  public reset(): void {
+    this.steps = [];
+    this.conversationHistory = [];
+    this.aborted = false;
+  }
+  public stop(): void {
+    this.aborted = true;
+  }
+}
+
+// Global instance for testing
+let globalAgent: BrowserAgent | null = null;
+
+export function getGlobalAgent(): BrowserAgent {
+  if (!globalAgent) {
+    globalAgent = new BrowserAgent();
+  }
+  return globalAgent;
+}
+
+if (typeof window !== "undefined") {
+  (window as any).BrowserAgent = BrowserAgent;
+  (window as any).getGlobalAgent = getGlobalAgent;
+}

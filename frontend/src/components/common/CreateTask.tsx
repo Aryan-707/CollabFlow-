@@ -1,0 +1,1058 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import RecurrenceSelector, { RecurrenceConfig } from "./RecurrenceSelector";
+import { HiDocumentText, HiCog, HiUsers, HiPaperClip, HiTrash, HiLink, HiCheck, HiChevronDown, HiSparkles } from "react-icons/hi2";
+import api from "@/lib/api";
+import {
+  Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList,
+} from "@/components/ui/command";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+
+import TaskDescription from "@/components/tasks/views/TaskDescription";
+import { useTask } from "@/contexts/task-context";
+import { TaskPriorities } from "@/utils/data/taskData";
+import { toast } from "sonner";
+import router from "next/router";
+import ActionButton from "./ActionButton";
+import { useProject } from "@/contexts/project-context";
+import { useSprint } from "@/contexts/sprint-context";
+import { formatDateForApi, getTodayDate } from "@/utils/handleDateChange";
+import MemberSelect from "./MemberSelect";
+import { Plus, Eye, X } from "lucide-react";
+import { Button } from "../ui";
+
+interface CreateTaskProps {
+  workspaceSlug?: string;
+  projectSlug?: string;
+  workspace: string | { id: string; name: string };
+  projects: any[];
+}
+
+const TaskSectionHeader = ({ icon: Icon, title }: { icon: any; title: string }) => (
+  <div className="flex items-center gap-2 mb-3">
+    <Icon size={16} className="text-[var(--primary)]" />
+    <h2 className="text-sm font-semibold text-[var(--foreground)]">{title}</h2>
+  </div>
+);
+
+export default function CreateTask({ projectSlug, workspace, projects }: CreateTaskProps) {
+  const { createTaskWithAttachements } = useTask();
+  const { getProjectMembers, getTaskStatusByProject } = useProject();
+  const { getSprintsByProject, getActiveSprint } = useSprint();
+
+  const [selectedProject, setSelectedProject] = useState<any>(null);
+  const [members, setMembers] = useState<any[]>([]);
+  const [membersLoading, setMembersLoading] = useState(false);
+  const [availableStatuses, setAvailableStatuses] = useState<any[]>([]);
+  const [sprints, setSprints] = useState<any[]>([]);
+  const [loadingSprints, setLoadingSprints] = useState(false);
+  const [formData, setFormData] = useState({
+    title: "",
+    description: "",
+    status: "",
+    priority: "MEDIUM",
+    type: "TASK",
+    storyPoints: "",
+    startDate: "",
+    dueDate: "",
+    sprintId: "",
+    parentTaskId: "",
+  });
+  const [assignees, setAssignees] = useState<any[]>([]);
+  const [reporters, setReporters] = useState<any[]>([]);
+  const [attachments, setAttachments] = useState<File[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [recurrenceConfig, setRecurrenceConfig] = useState<RecurrenceConfig | null>(null);
+  const [parentTasks, setParentTasks] = useState<any[]>([]);
+  const [loadingParentTasks, setLoadingParentTasks] = useState(false);
+  const [isGeneratingDescription, setIsGeneratingDescription] = useState(false);
+  const descriptionGeneratedRef = useRef(false);
+  const aiDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Multi-select & preview state for attachments
+  const [isSelectMode, setIsSelectMode] = useState(false);
+  const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
+  const [previewFile, setPreviewFile] = useState<{ url: string; name: string; type: string } | null>(null);
+
+  const toggleSelectIndex = (index: number) => {
+    setSelectedIndices((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  };
+
+  const toggleSelectAllAttachments = () => {
+    if (selectedIndices.size === attachments.length) {
+      setSelectedIndices(new Set());
+    } else {
+      setSelectedIndices(new Set(attachments.map((_, i) => i)));
+    }
+  };
+
+  const removeSelectedAttachments = () => {
+    setAttachments((prev) => prev.filter((_, i) => !selectedIndices.has(i)));
+    setSelectedIndices(new Set());
+    setIsSelectMode(false);
+  };
+
+  const exitAttachmentSelectMode = () => {
+    setIsSelectMode(false);
+    setSelectedIndices(new Set());
+  };
+
+  const openFilePreview = useCallback((file: File) => {
+    const url = URL.createObjectURL(file);
+    setPreviewFile({ url, name: file.name, type: file.type });
+  }, []);
+
+  const closeFilePreview = useCallback(() => {
+    if (previewFile) {
+      URL.revokeObjectURL(previewFile.url);
+    }
+    setPreviewFile(null);
+  }, [previewFile]);
+
+  const [openParentTask, setOpenParentTask] = useState(false);
+  const [parentTaskSearch, setParentTaskSearch] = useState("");
+
+  const filteredParentTasks = parentTasks
+    .filter((task) => {
+      const searchLower = parentTaskSearch.toLowerCase();
+      return (
+        task.title.toLowerCase().includes(searchLower) ||
+        (task.taskNumber && task.taskNumber.toString().toLowerCase().includes(searchLower))
+      );
+    })
+    .slice(0, 5);
+
+  const isFormValid = (): boolean => {
+    const hasTitle = formData.title.trim().length > 0;
+    const hasProject = selectedProject?.id;
+    const hasPriority = formData.priority.length > 0;
+    const hasParent = formData.type !== "SUBTASK" || formData.parentTaskId;
+    return hasTitle && hasProject && hasPriority && !!hasParent;
+  };
+
+  const handleFormDataChange = (field: string, value: string) => {
+    setFormData((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handleProjectChange = (projectId: string) => {
+    const project = projects.find((p) => p.id === projectId);
+    setSelectedProject(project);
+    setAssignees([]);
+    setReporters([]);
+  };
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) {
+      const newFiles = Array.from(e.target.files);
+      setAttachments((prev) => [...prev, ...newFiles]);
+    }
+  };
+
+  const handleDragEnter = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+
+    const droppedFiles = Array.from(e.dataTransfer.files);
+    setAttachments((prev) => [...prev, ...droppedFiles]);
+  };
+
+  const removeAttachment = (index: number) => {
+    setAttachments((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const formatFileSize = (bytes: number): string => {
+    if (bytes === 0) return "0 Bytes";
+    const k = 1024;
+    const sizes = ["Bytes", "KB", "MB", "GB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + " " + sizes[i];
+  };
+
+  useEffect(() => {
+    const fetchProjectMembers = async (projectId: string) => {
+      if (!projectId || !getProjectMembers) return;
+
+      // setMembersLoading(true);
+      try {
+        const fetchedMembers = await getProjectMembers(projectId);
+
+        const normalizedMembers = Array.isArray(fetchedMembers)
+          ? fetchedMembers.map((m) => ({
+            id: m.user?.id || m.id,
+            firstName: m.user?.firstName || "",
+            lastName: m.user?.lastName || "",
+            email: m.user?.email || "",
+            role: m.role,
+          }))
+          : [];
+
+        setMembers(normalizedMembers);
+      } catch (error) {
+        console.error("Failed to fetch project members:", error);
+        setMembers([]);
+        toast.error("Failed to load project members");
+      } finally {
+        // setMembersLoading(false);
+      }
+    };
+
+    const fetchProjectStatuses = async (projectId: string) => {
+      if (!projectId || !getTaskStatusByProject) return;
+
+      try {
+        const statuses = await getTaskStatusByProject(projectId);
+        setAvailableStatuses(statuses);
+
+        // Auto-select the default status from the project's workflow
+        const defaultStatus =
+          statuses.find((s: any) => s.isDefault) || statuses[0];
+        if (defaultStatus) {
+          setFormData((prev) => ({ ...prev, status: defaultStatus.id }));
+        }
+      } catch (error) {
+        console.error("Failed to fetch project statuses:", error);
+        setAvailableStatuses([]);
+        toast.error("Failed to load project statuses");
+      }
+    };
+
+    const fetchProjectSprints = async (projectId: string) => {
+      if (!projectId || !getSprintsByProject) return;
+
+      const project = projects.find(p => p.id === projectId);
+      if (!project) return;
+
+      setLoadingSprints(true);
+      try {
+        const [projectSprints, activeSprint] = await Promise.all([
+          getSprintsByProject(project.slug),
+          getActiveSprint(projectId),
+        ]);
+        setSprints(projectSprints || []);
+
+        if (activeSprint) {
+          setFormData(prev => ({ ...prev, sprintId: activeSprint.id }));
+        }
+      } catch (error) {
+        console.error("Failed to fetch project sprints:", error);
+        setSprints([]);
+        toast.error("Failed to load project sprints");
+      } finally {
+        setLoadingSprints(false);
+      }
+    };
+
+    if (selectedProject?.id) {
+      fetchProjectMembers(selectedProject.id);
+      fetchProjectStatuses(selectedProject.id);
+      fetchProjectSprints(selectedProject.id);
+    } else {
+      setMembers([]);
+      setAvailableStatuses([]);
+      setSprints([]);
+    }
+  }, [selectedProject?.id]);
+
+  useEffect(() => {
+    if (formData.type === "SUBTASK" && selectedProject?.id) {
+      loadParentTasks(selectedProject.id);
+    } else {
+      setParentTasks([]);
+      setFormData((prev) => ({ ...prev, parentTaskId: "" }));
+    }
+  }, [formData.type, selectedProject?.id]);
+
+  const loadParentTasks = async (projectId: string) => {
+    setLoadingParentTasks(true);
+    try {
+      const api = (await import("@/lib/api")).default;
+      const organizationId = localStorage.getItem("currentOrganizationId");
+      if (!organizationId) return;
+      const response = await api.get(`/tasks?organizationId=${organizationId}&projectId=${projectId}&parentTaskId=null`);
+      const tasks = Array.isArray(response.data) ? response.data : (response.data?.data || []);
+      setParentTasks(tasks);
+    } catch (error) {
+      console.error("Failed to load parent tasks:", error);
+      setParentTasks([]);
+    } finally {
+      setLoadingParentTasks(false);
+    }
+  };
+
+  useEffect(() => {
+    if (projectSlug && projects.length > 0) {
+      const project = projects.find((p) => p.slug === projectSlug);
+      if (project && selectedProject?.id !== project.id) {
+        setSelectedProject(project);
+      }
+    } else if (projects.length === 1 && !selectedProject) {
+      setSelectedProject(projects[0]);
+    }
+  }, [projectSlug, projects, selectedProject?.id]);
+
+  useEffect(() => {
+    const aiEnabled = localStorage.getItem("aiEnabled") === "true";
+    if (!aiEnabled) return;
+
+    const title = formData.title.trim();
+
+    if (title.length < 5 || formData.description.trim().length > 0 || descriptionGeneratedRef.current) {
+      return;
+    }
+
+    if (aiDebounceRef.current) {
+      clearTimeout(aiDebounceRef.current);
+    }
+
+    aiDebounceRef.current = setTimeout(async () => {
+      setFormData((prev) => {
+        if (prev.description.trim().length > 0 || prev.title.trim() !== title) {
+          return prev;
+        }
+        generateAiDescription(title, prev.type);
+        return prev;
+      });
+    }, 1500);
+
+    return () => {
+      if (aiDebounceRef.current) {
+        clearTimeout(aiDebounceRef.current);
+      }
+    };
+  }, [formData.title]);
+
+  const generateAiDescription = async (title: string, taskType: string) => {
+    setIsGeneratingDescription(true);
+    try {
+      const response = await api.post("/ai-chat/generate-description", {
+        title,
+        taskType,
+      });
+      if (response.data.success && response.data.description) {
+        setFormData((prev) => {
+          if (prev.description.trim().length === 0) {
+            descriptionGeneratedRef.current = true;
+            return { ...prev, description: response.data.description };
+          }
+          return prev;
+        });
+      }
+    } catch (error) {
+      console.error("AI description generation failed:", error);
+    } finally {
+      setIsGeneratingDescription(false);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent | React.MouseEvent) => {
+    e.preventDefault();
+    if (!isFormValid()) {
+      if (!formData.title.trim()) toast.error("Please enter a task title.");
+      else if (!selectedProject?.id) toast.error("Please select a project.");
+      else toast.error("Please fill in all required fields.");
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+
+      const defaultStatus =
+        availableStatuses.find((status) => status.isDefault) || availableStatuses[0];
+
+
+      const taskData: any = {
+        title: formData.title.trim(),
+        description: formData.description.trim() || "",
+        priority: formData.priority.toUpperCase() as "LOW" | "MEDIUM" | "HIGH" | "HIGHEST",
+        type: formData.type as "TASK" | "BUG" | "EPIC" | "STORY" | "SUBTASK",
+        storyPoints: formData.storyPoints ? parseInt(formData.storyPoints) : undefined,
+        startDate: formData.startDate ? formatDateForApi(formData.startDate)
+          : formatDateForApi(getTodayDate()),
+        dueDate: formData.dueDate
+          ? formatDateForApi(formData.dueDate)
+          : formatDateForApi(getTodayDate()),
+        projectId: selectedProject.id,
+        statusId: formData.status || defaultStatus?.id,
+      };
+      if (formData.sprintId) taskData.sprintId = formData.sprintId;
+      if (formData.type === "SUBTASK" && formData.parentTaskId) taskData.parentTaskId = formData.parentTaskId;
+
+      if (assignees.length > 0) taskData.assigneeIds = assignees.map((a) => a.id);
+      if (reporters.length > 0) taskData.reporterIds = reporters.map((r) => r.id);
+      if (attachments.length > 0) taskData.attachments = attachments;
+
+      // Add recurrence configuration if enabled
+      if (recurrenceConfig) {
+        taskData.isRecurring = true;
+        taskData.recurrenceConfig = {
+          ...recurrenceConfig,
+          endDate: recurrenceConfig.endDate?.toISOString(),
+        };
+      }
+
+      const newTask = await createTaskWithAttachements(taskData);
+
+      toast.success(`Task named ${newTask.title} created successfully!`);
+      router.back();
+    } catch (error: any) {
+      toast.error(error?.message || "Error creating task");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="dashboard-container">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="lg:col-span-2">
+          <form id="create-task-form" onSubmit={handleSubmit} className="flex flex-col gap-6">
+            <Card className="border-none bg-[var(--card)] gap-0 rounded-md">
+              <CardHeader className="pb-0">
+                <TaskSectionHeader icon={HiDocumentText} title="Basic Information" />
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="space-y-2">
+                  <Label htmlFor="title">
+                    Task Title <span className="projects-form-label-required">*</span>
+                  </Label>
+                  <Input
+                    id="title"
+                    name="title"
+                    value={formData.title}
+                    onChange={(e) => handleFormDataChange("title", e.target.value)}
+                    placeholder="What needs to be done?"
+                    className="border-[var(--border)] bg-[var(--background)]"
+                  />
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card className="border-none bg-[var(--card)] gap-0 rounded-md">
+              <CardHeader className="flex items-center justify-between pb-2">
+                <TaskSectionHeader
+                  icon={HiPaperClip}
+                  title={`Attachment(s) ${attachments.length > 0 ? `(${attachments.length})` : ""}`}
+                />
+                <div>
+                  <Input
+                    type="file"
+                    multiple
+                    onChange={handleFileSelect}
+                    className="hidden"
+                    id="file-upload"
+                    accept="*/*"
+                  />
+                  <Label
+                    htmlFor="file-upload"
+                    className="py-2 relative h-9 px-4 bg-[var(--primary)] cursor-pointer rounded-md hover:bg-[var(--primary)]/90 text-[var(--primary-foreground)] shadow-sm hover:shadow-md transition-all duration-200 font-medium"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>Add Attachment</span>
+                  </Label>
+                </div>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {attachments.length > 0 ? (
+                  <div className="space-y-2">
+                    {/* Multi-select toolbar */}
+                    {attachments.length > 1 && (
+                      <div className="flex items-center justify-between gap-2">
+                        {isSelectMode ? (
+                          <div className="flex items-center gap-3 w-full">
+                            <label className="flex items-center gap-2 text-sm text-[var(--muted-foreground)] cursor-pointer select-none">
+                              <input
+                                type="checkbox"
+                                checked={selectedIndices.size === attachments.length && attachments.length > 0}
+                                onChange={toggleSelectAllAttachments}
+                                className="w-4 h-4 rounded border-[var(--border)] accent-[var(--primary)] cursor-pointer"
+                              />
+                              Select All ({selectedIndices.size}/{attachments.length})
+                            </label>
+                            <div className="flex items-center gap-2 ml-auto">
+                              {selectedIndices.size > 0 && (
+                                <ActionButton
+                                  onClick={removeSelectedAttachments}
+                                  className="h-8 px-3 text-xs cursor-pointer border-none bg-[var(--destructive)]/10 hover:bg-[var(--destructive)]/20 text-[var(--destructive)]"
+                                >
+                                  <div className="flex items-center gap-1.5">
+                                    <HiTrash className="w-3.5 h-3.5" />
+                                    Remove {selectedIndices.size} selected
+                                  </div>
+                                </ActionButton>
+                              )}
+                              <ActionButton
+                                onClick={exitAttachmentSelectMode}
+                                secondary
+                                className="h-8 px-3 text-xs cursor-pointer"
+                              >
+                                Cancel
+                              </ActionButton>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex items-center ml-auto">
+                            <ActionButton
+                              onClick={() => setIsSelectMode(true)}
+                              secondary
+                              className="h-8 px-3 text-xs cursor-pointer"
+                            >
+                              Select
+                            </ActionButton>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    <div className="space-y-2 max-h-60 overflow-y-auto">
+                      {attachments.map((file, index) => (
+                        <div
+                          key={index}
+                          className={`flex items-center justify-between p-3 bg-[var(--background)] border rounded-md transition-colors ${isSelectMode && selectedIndices.has(index)
+                            ? "border-[var(--primary)] bg-[var(--primary)]/5"
+                            : "border-[var(--border)]"
+                            }`}
+                        >
+                          <div className="flex items-center gap-3 flex-1 min-w-0">
+                            {isSelectMode && (
+                              <input
+                                type="checkbox"
+                                checked={selectedIndices.has(index)}
+                                onChange={() => toggleSelectIndex(index)}
+                                className="w-4 h-4 rounded border-[var(--border)] accent-[var(--primary)] cursor-pointer flex-shrink-0"
+                              />
+                            )}
+                            <HiPaperClip
+                              size={16}
+                              className="text-[var(--muted-foreground)] flex-shrink-0"
+                            />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm font-medium text-[var(--foreground)] truncate">
+                                {file.name}
+                              </p>
+                              <p className="text-xs text-[var(--muted-foreground)]">
+                                {formatFileSize(file.size)}
+                              </p>
+                            </div>
+                          </div>
+                          {!isSelectMode && (
+                            <div className="flex items-center gap-2 flex-shrink-0">
+                              {(file.type.startsWith("image/") || file.type === "application/pdf" || file.type.startsWith("video/")) && (
+                                <button
+                                  type="button"
+                                  onClick={() => openFilePreview(file)}
+                                  className="p-1.5 hover:bg-[var(--accent)] rounded transition-colors cursor-pointer"
+                                  title="Preview"
+                                >
+                                  <Eye className="w-4 h-4 text-[var(--muted-foreground)]" />
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => removeAttachment(index)}
+                                className="p-1.5 hover:bg-red-100 dark:hover:bg-red-900/20 rounded transition-colors cursor-pointer"
+                                title="Remove"
+                              >
+                                <HiTrash className="w-4 h-4 text-[var(--destructive)]" />
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-center pt-5">No Attachment(s) </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* File Preview Modal */}
+            {previewFile && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={closeFilePreview}>
+                <div
+                  className="relative bg-[var(--card)] rounded-lg shadow-xl max-w-4xl max-h-[90vh] w-full mx-4 overflow-hidden"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="flex items-center justify-between p-4 border-b border-[var(--border)]">
+                    <p className="text-sm font-medium text-[var(--foreground)] truncate">{previewFile.name}</p>
+                    <button
+                      type="button"
+                      onClick={closeFilePreview}
+                      className="p-1.5 hover:bg-[var(--accent)] rounded transition-colors cursor-pointer"
+                    >
+                      <X className="w-5 h-5 text-[var(--muted-foreground)]" />
+                    </button>
+                  </div>
+                  <div className="p-4 flex items-center justify-center overflow-auto max-h-[calc(90vh-64px)]">
+                    {previewFile.type.startsWith("image/") && (
+                      <img src={previewFile.url} alt={previewFile.name} className="max-w-full max-h-[75vh] object-contain rounded" />
+                    )}
+                    {previewFile.type === "application/pdf" && (
+                      <iframe src={previewFile.url} className="w-full h-[75vh] rounded" title={previewFile.name} />
+                    )}
+                    {previewFile.type.startsWith("video/") && (
+                      <video src={previewFile.url} controls className="max-w-full max-h-[75vh] rounded">
+                        Your browser does not support video playback.
+                      </video>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <Card className="border-none bg-[var(--card)] gap-0 rounded-md">
+              <CardHeader className="pb-0 flex flex-row items-center justify-between">
+                <TaskSectionHeader icon={HiDocumentText} title="Description" />
+                {isGeneratingDescription && (
+                  <div className="flex items-center gap-1.5 text-xs text-[var(--primary)] animate-pulse">
+                    <HiSparkles className="w-3.5 h-3.5" />
+                  </div>
+                )}
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <TaskDescription
+                  value={formData.description}
+                  onChange={(value) => handleFormDataChange("description", value)}
+                  editMode={true}
+                />
+              </CardContent>
+            </Card>
+          </form>
+        </div>
+
+        <div className="lg:col-span-1 space-y-6">
+          <Card className="border-none bg-[var(--card)] gap-0 rounded-md">
+            <CardHeader>
+              <TaskSectionHeader icon={HiCog} title="Workspace & Project" />
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="workspace">
+                  Workspace <span className="projects-form-label-required">*</span>
+                </Label>
+                <Input
+                  id="workspace"
+                  data-automation-id="task-workspace-input"
+                  value={
+                    workspace && typeof workspace === "object" && workspace !== null
+                      ? (workspace.name ?? "")
+                      : typeof workspace === "string"
+                        ? workspace
+                        : ""
+                  }
+                  readOnly
+                  className="w-full border-[var(--border)] bg-[var(--background)] cursor-not-allowed"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="project">
+                  Project <span className="projects-form-label-required">*</span>
+                </Label>
+                {projects.length === 1 && projects[0] ? (
+                  <Input
+                    id="project"
+                    value={projects[0].name}
+                    readOnly
+                    className="w-full border-[var(--border)] bg-[var(--background)] cursor-not-allowed"
+                  />
+                ) : (
+                  <Select value={selectedProject?.id || ""} onValueChange={handleProjectChange}>
+                    <SelectTrigger data-automation-id="task-project-select" className="w-full border-[var(--border)] bg-[var(--background)]">
+                      <SelectValue placeholder="Select a project" />
+                    </SelectTrigger>
+                    <SelectContent className="border-[var(--border)] bg-[var(--popover)]">
+                      {projects.map((project) => (
+                        <SelectItem
+                          className="hover:bg-[var(--hover-bg)]"
+                          key={project.id}
+                          value={project.id}
+                        >
+                          {project.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="border-none bg-[var(--card)] gap-0 rounded-md">
+            <CardHeader>
+              <TaskSectionHeader icon={HiCog} title="Task Configuration" />
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="status">
+                  Status
+                  {/* <span className="projects-form-label-required">*</span> */}
+                </Label>
+                <Select
+                  value={formData.status}
+                  onValueChange={(value) => handleFormDataChange("status", value)}
+                  disabled={availableStatuses.length === 0}
+                >
+                  <SelectTrigger className="w-full border-[var(--border)] bg-[var(--background)]">
+                    <SelectValue placeholder="Select a status" />
+                  </SelectTrigger>
+                  <SelectContent className="border-[var(--border)] bg-[var(--popover)]">
+                    {availableStatuses.length > 0 ? (
+                      availableStatuses.map((status) => (
+                        <SelectItem
+                          className="hover:bg-[var(--hover-bg)]"
+                          key={status.id}
+                          value={status.id}
+                        >
+                          {status.name}
+                        </SelectItem>
+                      ))
+                    ) : (
+                      <SelectItem value="__loading" disabled>
+                        Loading statuses...
+                      </SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  If left empty, the default project status will be automatically selected.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="priority">
+                  Priority <span className="projects-form-label-required">*</span>
+                </Label>
+                <Select
+                  value={formData.priority}
+                  onValueChange={(value) => handleFormDataChange("priority", value)}
+                >
+                  <SelectTrigger className="w-full border-[var(--border)] bg-[var(--background)]">
+                    <SelectValue placeholder="Select priority" />
+                  </SelectTrigger>
+                  <SelectContent className="border-[var(--border)] bg-[var(--popover)]">
+                    {TaskPriorities.map((priority) => (
+                      <SelectItem
+                        className="hover:bg-[var(--hover-bg)]"
+                        key={priority.value}
+                        value={priority.value}
+                      >
+                        {priority.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="type">
+                  Task Type <span className="projects-form-label-required">*</span>
+                </Label>
+                <Select
+                  value={formData.type || "TASK"}
+                  onValueChange={(value) => handleFormDataChange("type", value)}
+                >
+                  <SelectTrigger className="w-full border-[var(--border)] bg-[var(--background)]">
+                    <SelectValue placeholder="Select type" />
+                  </SelectTrigger>
+                  <SelectContent className="border-[var(--border)] bg-[var(--popover)]">
+                    {[
+                      { value: "TASK", name: "Task" },
+                      { value: "BUG", name: "Bug" },
+                      { value: "EPIC", name: "Epic" },
+                      { value: "STORY", name: "Story" },
+                      { value: "SUBTASK", name: "Subtask" },
+                    ].map((type) => (
+                      <SelectItem
+                        className="hover:bg-[var(--hover-bg)]"
+                        key={type.value}
+                        value={type.value}
+                      >
+                        {type.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {formData.type === "SUBTASK" && (
+                <div className="space-y-2">
+                  <Label htmlFor="parentTask">
+                    Parent Task <span className="projects-form-label-required">*</span>
+                  </Label>
+                  <Popover open={openParentTask} onOpenChange={setOpenParentTask}>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="outline"
+                        role="combobox"
+                        aria-expanded={openParentTask}
+                        className="w-full justify-between bg-[var(--background)] border-[var(--border)] font-normal px-3"
+                        disabled={!selectedProject?.id || loadingParentTasks}
+                      >
+                        <span className="truncate">
+                          {formData.parentTaskId
+                            ? parentTasks.find((task) => task.id === formData.parentTaskId)?.title || formData.parentTaskId
+                            : !selectedProject?.id
+                              ? "Select project first"
+                              : loadingParentTasks
+                                ? "Loading..."
+                                : "Select parent task"}
+                        </span>
+                        <HiChevronDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-[400px] p-0 border-[var(--border)] bg-[var(--popover)]" align="start">
+                      <Command shouldFilter={false}>
+                        <CommandInput
+                          placeholder="Search parent task..."
+                          value={parentTaskSearch}
+                          onValueChange={setParentTaskSearch}
+                        />
+                        <CommandList>
+                          <CommandEmpty>No parent task found.</CommandEmpty>
+                          <CommandGroup>
+                            {filteredParentTasks.map((task) => (
+                              <CommandItem
+                                key={task.id}
+                                value={task.id}
+                                onSelect={() => {
+                                  handleFormDataChange("parentTaskId", task.id === formData.parentTaskId ? "" : task.id);
+                                  setOpenParentTask(false);
+                                }}
+                                className="cursor-pointer hover:bg-[var(--hover-bg)] aria-selected:bg-[var(--hover-bg)]"
+                              >
+                                <HiCheck
+                                  className={`mr-2 h-4 w-4 ${formData.parentTaskId === task.id ? "opacity-100" : "opacity-0"
+                                    }`}
+                                />
+                                <span className="truncate">
+                                  {task.taskNumber ? `${task.taskNumber} - ` : ""}
+                                  {task.title}
+                                </span>
+                              </CommandItem>
+                            ))}
+                          </CommandGroup>
+                        </CommandList>
+                      </Command>
+                    </PopoverContent>
+                  </Popover>
+                </div>
+              )}
+
+              <div className="space-y-2">
+                <Label htmlFor="storyPoints">Story Points</Label>
+                <Input
+                  id="storyPoints"
+                  name="storyPoints"
+                  type="number"
+                  min="0"
+                  value={formData.storyPoints}
+                  onChange={(e) => handleFormDataChange("storyPoints", e.target.value)}
+                  placeholder="e.g. 5"
+                  className="w-full border-[var(--border)] bg-[var(--background)]"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="sprint">Sprint</Label>
+                <Select
+                  value={formData.sprintId}
+                  onValueChange={(value) => handleFormDataChange("sprintId", value)}
+                  disabled={loadingSprints}
+                >
+                  <SelectTrigger className="w-full border-[var(--border)] bg-[var(--background)]">
+                    <SelectValue
+                      placeholder={
+                        !selectedProject?.id
+                          ? "Select project first"
+                          : loadingSprints
+                            ? "Loading..."
+                            : "Select sprint (optional)"
+                      }
+                    />
+                  </SelectTrigger>
+                  <SelectContent className="border-[var(--border)] bg-[var(--popover)]">
+                    {sprints.map((sprint) => (
+                      <SelectItem
+                        className="hover:bg-[var(--hover-bg)]"
+                        key={sprint.id}
+                        value={sprint.id}
+                      >
+                        <div className="flex items-center gap-2">
+                          {sprint.name} {sprint.isDefault === true && "(Default)"}
+                        </div>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="startDate">Start Date</Label>
+                <Input
+                  id="startDate"
+                  name="startDate"
+                  type="date"
+                  value={formData.startDate}
+                  onChange={(e) => {
+                    const newStart = e.target.value;
+                    handleFormDataChange("startDate", newStart);
+                    if (formData.dueDate && newStart && newStart > formData.dueDate) {
+                      handleFormDataChange("dueDate", "");
+                    }
+                  }}
+                  max={formData.dueDate || undefined}
+                  onClick={(e) => {
+                    const target = e.target as HTMLInputElement;
+                    target.showPicker?.();
+                  }}
+                  className="w-full border-[var(--border)] bg-[var(--background)] cursor-pointer [&::-webkit-calendar-picker-indicator]:cursor-pointer [&::-webkit-calendar-picker-indicator]:opacity-100 [&::-webkit-calendar-picker-indicator]:mt-1"
+                  style={{
+                    colorScheme: "dark",
+                  }}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="dueDate">Due Date</Label>
+                <Input
+                  id="dueDate"
+                  name="dueDate"
+                  type="date"
+                  value={formData.dueDate}
+                  min={formData.startDate || undefined}
+                  onChange={(e) => handleFormDataChange("dueDate", e.target.value)}
+                  onClick={(e) => {
+                    const target = e.target as HTMLInputElement;
+                    target.showPicker?.();
+                  }}
+                  className="w-full border-[var(--border)] bg-[var(--background)] cursor-pointer [&::-webkit-calendar-picker-indicator]:cursor-pointer [&::-webkit-calendar-picker-indicator]:opacity-100 [&::-webkit-calendar-picker-indicator]:mt-1"
+                  style={{
+                    colorScheme: "dark",
+                  }}
+                />
+              </div>
+
+              {/* Recurrence Configuration */}
+              <div className="space-y-2">
+                <RecurrenceSelector
+                  value={recurrenceConfig}
+                  onChange={setRecurrenceConfig}
+                />
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="border-none bg-[var(--card)] gap-0 rounded-md">
+            <CardHeader className="flex">
+              <TaskSectionHeader icon={HiUsers} title="Assignment" />
+              {/* <span className="projects-form-label-required">*</span> */}
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {membersLoading ? (
+                <div className="text-center py-4">
+                  <div className="animate-spin h-4 w-4 border-2 border-[var(--primary)] border-t-transparent rounded-full mx-auto mb-2" />
+                  <p className="text-sm text-[var(--muted-foreground)]">
+                    Loading project members...
+                  </p>
+                </div>
+              ) : members.length === 0 ? (
+                <p className="text-sm text-red-500 text-center">No project members found.</p>
+              ) : (
+                <>
+                  <MemberSelect
+                    label="Assignees"
+                    selectedMembers={assignees}
+                    onChange={setAssignees}
+                    members={members}
+                    projectId={selectedProject?.id}
+                    disabled={!selectedProject?.id || members.length === 0}
+                    placeholder={
+                      !selectedProject?.id ? "Select a project first" : "Select assignees..."
+                    }
+                  />
+
+                  <MemberSelect
+                    label="Reporters"
+                    selectedMembers={reporters}
+                    onChange={setReporters}
+                    members={members}
+                    projectId={selectedProject?.id}
+                    disabled={!selectedProject?.id || members.length === 0}
+                    placeholder={
+                      !selectedProject?.id ? "Select a project first" : "Select reporters..."
+                    }
+                  />
+                </>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+      <div className="sticky bottom-0 z-10 bg-[var(--background)]/80 backdrop-blur-sm border-t border-[var(--border)] py-3 -mx-6 px-6 lg:col-span-3" id="submit-form-button">
+        <div className="flex items-center justify-end gap-3">
+          <ActionButton
+            onClick={() => router.back()}
+            type="button"
+            variant="outline"
+            secondary
+            className="h-8 px-3 cursor-pointer"
+          >
+            Cancel
+          </ActionButton>
+          <ActionButton
+            id="create-task-submit"
+            data-automation-id="create-task-submit"
+            aria-label="Create Task"
+            onClick={handleSubmit}
+            type="button"
+            disabled={isSubmitting}
+            primary
+          >
+            {isSubmitting ? (
+              <div className="flex items-center">
+                <div className="animate-spin mr-2 h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                Creating task...
+              </div>
+            ) : (
+              "Create Task"
+            )}
+          </ActionButton>
+        </div>
+      </div>
+    </div>
+  );
+}

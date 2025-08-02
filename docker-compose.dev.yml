@@ -1,0 +1,73 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: collabflow
+      POSTGRES_PASSWORD: collabflow
+      POSTGRES_DB: collabflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U collabflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - collabflow-network
+
+  # Redis for BullMQ + Socket.io Pub/Sub
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - collabflow-network
+
+  # Application (Backend + Frontend)
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    working_dir: /app
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://collabflow:collabflow@postgres:5432/collabflow
+      REDIS_HOST: redis
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:3000/api
+    ports:
+      - "3000:3000"  # Backend
+      - "3001:3001"  # Frontend
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - /app/backend/node_modules
+      - /app/frontend/node_modules
+      - app_uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - collabflow-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  app_uploads:
+    driver: local
+
+networks:
+  collabflow-network:
+    driver: bridge

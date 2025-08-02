@@ -1,0 +1,33 @@
+{
+  "name": "@collabflow/platform",
+  "version": "1.0.0",
+  "description": "CollabFlow - Event-Driven AI Workflow Engine with Real-Time Collaboration",
+  "author": "Aryan Aggarwal <aryanaggarwal0420@gmail.com>",
+  "private": true,
+  "license": "MIT",
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "scripts": {
+    "dev": "concurrently -n frontend,backend -c cyan,magenta \"npm run dev:frontend\" \"npm run dev:backend\"",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "dev:backend": "npm run dev --workspace=backend",
+    "build": "npm run build --workspaces --if-present",
+    "build:frontend": "npm run build --workspace=frontend",
+    "build:backend": "npm run build --workspace=backend",
+    "lint": "npm run lint --workspaces --if-present",
+    "clean": "npm run clean --workspaces --if-present",
+    "db:migrate": "npm run prisma:migrate:dev --workspace=backend",
+    "db:generate": "npm run prisma:generate --workspace=backend",
+    "db:studio": "npm run prisma:studio --workspace=backend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "dependencies": {}
+}

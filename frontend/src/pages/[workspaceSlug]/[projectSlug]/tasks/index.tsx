@@ -1,0 +1,1450 @@
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useRouter } from "next/router";
+import { useTranslation } from "react-i18next";
+import { NewTaskModal } from "@/components/tasks/NewTaskModal";
+import { CsvImportModal } from "@/components/tasks/CsvImportModal";
+import { useWorkspaceContext } from "@/contexts/workspace-context";
+import { useProjectContext } from "@/contexts/project-context";
+import { useTask } from "@/contexts/task-context";
+import { useAuth } from "@/contexts/auth-context";
+import TaskListView from "@/components/tasks/views/TaskListView";
+import TaskGanttView from "@/components/tasks/views/TaskGanttView";
+import { HiXMark } from "react-icons/hi2";
+import { Input } from "@/components/ui/input";
+import { ColumnConfig, Project, ViewMode, Workspace } from "@/types";
+import { TaskPriorities } from "@/utils/data/taskData";
+import ErrorState from "@/components/common/ErrorState";
+import EmptyState from "@/components/common/EmptyState";
+import { PageHeader } from "@/components/common/PageHeader";
+import { HiSearch } from "react-icons/hi";
+import ActionButton from "@/components/common/ActionButton";
+import TabView from "@/components/tasks/TabView";
+import Pagination from "@/components/common/Pagination";
+import { KanbanBoard } from "@/components/tasks/KanbanBoard";
+import { ColumnManager } from "@/components/tasks/ColumnManager";
+import { FilterDropdown, useGenericFilters } from "@/components/common/FilterDropdown";
+import { CheckSquare, Flame, User, Users, Download, Upload, Shapes } from "lucide-react";
+import SortingManager, { SortOrder, SortField } from "@/components/tasks/SortIngManager";
+import Tooltip from "@/components/common/ToolTip";
+import { TokenManager } from "@/lib/api";
+import { exportTasksToCSV, exportTasksToPDF, exportTasksToXLSX, exportTasksToJSON } from "@/utils/exportUtils";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/DropdownMenu";
+import TaskTableSkeleton from "@/components/skeletons/TaskTableSkeleton";
+import { KanbanColumnSkeleton } from "@/components/skeletons/KanbanColumnSkeleton";
+import { TaskTypeIcon } from "@/utils/data/taskData";
+import { useLayout } from "@/contexts/layout-context";
+import NotFound from "@/pages/404";
+import { useSlugRedirect, cacheSlugId } from "@/hooks/useSlugRedirect";
+
+function useDebounce<T>(value: T, delay: number): T {
+  const [debounced, setDebounced] = useState<T>(value);
+
+  useEffect(() => {
+    const handler = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(handler);
+  }, [value, delay]);
+
+  return debounced;
+}
+
+// Helper function to validate internal paths and prevent open redirect vulnerabilities
+function isValidInternalPath(path: string): boolean {
+  if (!path || typeof path !== 'string') return false;
+  // Ensure the path starts with / and doesn't contain protocol or domain
+  if (!path.startsWith('/')) return false;
+  if (path.includes('://') || path.startsWith('//')) return false;
+  return true;
+}
+
+// Helper function to sanitize slug inputs before URL construction
+function sanitizeSlug(slug: string | string[] | undefined): string {
+  if (!slug || typeof slug !== 'string') return '';
+  // Allow alphanumeric, dash, underscore, and dot
+  if (!/^[a-zA-Z0-9._-]+$/.test(slug)) return '';
+  return slug;
+}
+
+function ProjectTasksContent() {
+  const { t } = useTranslation("tasks");
+  const router = useRouter();
+  const { workspaceSlug, projectSlug } = router.query;
+  const workspaceApi = useWorkspaceContext();
+  const projectApi = useProjectContext();
+
+  const SORT_FIELD_KEY = "tasks_sort_field";
+  const SORT_ORDER_KEY = "tasks_sort_order";
+  const COLUMNS_KEY = "tasks_columns";
+
+  const {
+    getAllTasks,
+    getTaskKanbanStatus,
+    getCalendarTask,
+    getPublicProjectTasks,
+    tasks,
+    isLoading,
+    error: contextError,
+    taskResponse,
+    updateTask,
+  } = useTask();
+
+  const { getUserAccess, isAuthenticated } = useAuth();
+  const isAuth = isAuthenticated();
+
+  const [hasAccess, setHasAccess] = useState(false);
+  const [userAccess, setUserAccess] = useState(null);
+
+  const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [project, setProject] = useState<Project>(null);
+  const [kanban, setKanban] = useState<any[]>([]);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const [searchInput, setSearchInput] = useState("");
+  const [currentView, setCurrentView] = useState<"list" | "kanban" | "gantt">(() => {
+    const type =
+      typeof window !== "undefined"
+        ? new URLSearchParams(window.location.search).get("type")
+        : null;
+    return type === "list" || type === "gantt" || type === "kanban" ? type : "list";
+  });
+  const [kabBanSettingModal, setKabBanSettingModal] = useState(false);
+  const [ganttViewMode, setGanttViewMode] = useState<ViewMode>("days");
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+  const [isNewTaskModalOpen, setNewTaskModalOpen] = useState(false);
+  const [isCsvImportOpen, setCsvImportOpen] = useState(false);
+  const [selectedStatuses, setSelectedStatuses] = useState<string[]>([]);
+  const [selectedPriorities, setSelectedPriorities] = useState<string[]>([]);
+  const [selectedTaskTypes, setSelectedTaskTypes] = useState<string[]>([]);
+  const [availableStatuses, setAvailableStatuses] = useState<any[]>([]);
+  const [statusesLoaded, setStatusesLoaded] = useState(false);
+  const [availablePriorities] = useState(TaskPriorities);
+  const [availableTaskTypes] = useState(Object.keys(TaskTypeIcon));
+  const [projectMembers, setProjectMembers] = useState<any[]>([]);
+  const [membersLoaded, setMembersLoaded] = useState(false);
+  const [addTaskPriorities, setAddTaskPriorities] = useState<any[]>([]);
+  const [selectedAssignees, setSelectedAssignees] = useState<string[]>([]);
+  const [selectedReporters, setSelectedReporters] = useState<string[]>([]);
+  const [publicTasks, setPublicTasks] = useState<any[]>([]);
+  const [publicTasksTotal, setPublicTasksTotal] = useState(0);
+  const [isLoadingPublic, setIsLoadingPublic] = useState(false);
+  const [kanbanPage, setKanbanPage] = useState(1);
+  const [kanbanLimit, setKanbanLimit] = useState(25);
+  const [selectedTasks, setSelectedTasks] = useState<string[]>([]);
+  const [isInitialLoad, setIsInitialLoad] = useState(true);
+
+  const handleTaskSelect = (taskId: string) => {
+    setSelectedTasks((prev) =>
+      prev.includes(taskId) ? prev.filter((id) => id !== taskId) : [...prev, taskId]
+    );
+  };
+
+  const handleTasksSelect = useCallback((taskIds: string[], action: "add" | "remove" | "set") => {
+    setSelectedTasks((prev) => {
+      if (action === "set") return taskIds;
+      if (action === "add") {
+        const newIds = taskIds.filter((id) => !prev.includes(id));
+        return [...prev, ...newIds];
+      }
+      if (action === "remove") {
+        return prev.filter((id) => !taskIds.includes(id));
+      }
+      return prev;
+    });
+  }, []);
+  const error = contextError || localError;
+
+  const [sortField, setSortField] = useState<SortField>(() => {
+    return localStorage.getItem(SORT_FIELD_KEY) || "createdAt";
+  });
+
+  const [sortOrder, setSortOrder] = useState<SortOrder>(() => {
+    const stored = localStorage.getItem(SORT_ORDER_KEY);
+    return stored === "asc" || stored === "desc" ? stored : "desc";
+  });
+
+  const [columns, setColumns] = useState<ColumnConfig[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const stored = localStorage.getItem(COLUMNS_KEY);
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const checkAuthForAction = (action: () => void) => {
+    if (!isAuth) {
+      router.push("/login");
+      return;
+    }
+    action();
+  };
+
+  useEffect(() => {
+    localStorage.setItem(SORT_FIELD_KEY, sortField);
+  }, [sortField]);
+
+  useEffect(() => {
+    localStorage.setItem(SORT_ORDER_KEY, sortOrder);
+  }, [sortOrder]);
+
+  useEffect(() => {
+    localStorage.setItem(COLUMNS_KEY, JSON.stringify(columns));
+  }, [columns]);
+
+  const pagination = useMemo(() => {
+    if (!isAuth) {
+      const totalPages = Math.ceil(publicTasksTotal / pageSize);
+      return {
+        currentPage,
+        totalPages,
+        totalCount: publicTasksTotal,
+        hasNextPage: currentPage < totalPages,
+        hasPrevPage: currentPage > 1,
+      };
+    }
+
+    if (!taskResponse) {
+      return {
+        currentPage: 1,
+        totalPages: 0,
+        totalCount: 0,
+        hasNextPage: false,
+        hasPrevPage: false,
+      };
+    }
+
+    return {
+      currentPage: taskResponse.page,
+      totalPages: taskResponse.totalPages,
+      totalCount: taskResponse.total,
+      hasNextPage: taskResponse.page < taskResponse.totalPages,
+      hasPrevPage: taskResponse.page > 1,
+    };
+  }, [taskResponse, isAuth, publicTasksTotal, pageSize, currentPage]);
+
+  const routeRef = useRef<string>("");
+  const firstRenderRef = useRef(true);
+  const debouncedSearchQuery = useDebounce(searchInput, 500);
+  const hasValidAuth = !!isAuth && !!workspaceSlug && !!projectSlug;
+  const currentOrganizationId = TokenManager.getCurrentOrgId();
+  const { createSection } = useGenericFilters();
+
+  useEffect(() => {
+    if (project && isAuth) {
+      getUserAccess({ name: "project", id: project.id })
+        .then((data) => {
+          setHasAccess(data?.canChange);
+          setUserAccess(data);
+        })
+
+        .catch((error) => {
+          console.error("Error fetching user access:", error);
+        });
+    }
+  }, [project, isAuth]);
+
+  useEffect(() => {
+    if (typeof window !== "undefined" && isAuth) {
+      const params = new URLSearchParams(window.location.search);
+      const statusParams = params.get("statuses");
+      const priorityParams = params.get("priorities");
+      const typeParams = params.get("types");
+
+      if (statusParams) {
+        setSelectedStatuses(statusParams.split(","));
+      }
+      if (priorityParams) {
+        setSelectedPriorities(priorityParams.split(","));
+      }
+      if (typeParams) {
+        setSelectedTaskTypes(typeParams.split(","));
+      }
+    }
+  }, [isAuth]);
+
+  useEffect(() => {
+    const fetchMeta = async () => {
+      if (!project?.id || !isAuth) return;
+      try {
+        setAddTaskPriorities(TaskPriorities || []);
+      } catch (error) {
+        console.error("Failed to fetch priorities for Add Task row:", error);
+        setAddTaskPriorities([]);
+      }
+    };
+    fetchMeta();
+  }, [project?.id, isAuth]);
+
+  const validateRequiredData = useCallback(() => {
+    if (!isAuth) return true;
+
+    const issues = [];
+
+    if (!workspace?.id) issues.push("Missing workspace ID");
+    if (!currentOrganizationId) issues.push("Missing organization ID");
+    if (!project?.id) issues.push("Missing project ID");
+
+    if (issues.length > 0) {
+      console.error("Validation failed:", issues);
+      setLocalError(`Missing required data: ${issues.join(", ")}`);
+      return false;
+    }
+
+    return true;
+  }, [workspace?.id, currentOrganizationId, project?.id, isAuth]);
+
+  const { handleSlugNotFound } = useSlugRedirect();
+
+  const loadInitialData = useCallback(async () => {
+    try {
+      setLocalError(null);
+
+      const ws: Workspace | null = null;
+
+      const proj = await projectApi.getProjectBySlug(
+        projectSlug as string,
+        isAuth,
+        workspaceSlug as string
+      );
+
+      if (!proj) {
+        throw new Error(`Project "${projectSlug}" not found in workspace "${workspaceSlug}"`);
+      }
+
+      setWorkspace((proj.workspace as Workspace) || null);
+      setProject(proj);
+
+      cacheSlugId("project", projectSlug as string, proj.id);
+      if (proj.workspace?.id) {
+        cacheSlugId("workspace", workspaceSlug as string, proj.workspace.id);
+      }
+
+      return { ws, proj };
+    } catch (error) {
+      console.error("LoadInitialData error:", error);
+
+      const redirected = await handleSlugNotFound(
+        error,
+        workspaceSlug as string,
+        projectSlug as string,
+        workspace?.id,
+        project?.id
+      );
+      if (!redirected) {
+        setLocalError(error instanceof Error ? error.message : "Failed to load initial data");
+      }
+    }
+  }, [hasValidAuth, workspaceSlug, projectSlug, workspaceApi, projectApi, isAuth, handleSlugNotFound, workspace?.id, project?.id]);
+
+  const loadStatusData = useCallback(async () => {
+    if (!project?.id || statusesLoaded || !isAuth) return;
+    try {
+      const statuses = await projectApi.getTaskStatusByProject(project.id);
+      setAvailableStatuses(statuses || []);
+      setStatusesLoaded(true);
+    } catch (error) {
+      console.error("Failed to load task statuses:", error);
+      setAvailableStatuses([]);
+    }
+  }, [project?.id, statusesLoaded, projectApi, isAuth]);
+
+  const loadProjectMembers = useCallback(async () => {
+    if (!project?.id || membersLoaded || !isAuth) return;
+    try {
+      const members = await projectApi.getProjectMembers(project.id);
+      setProjectMembers(members || []);
+      setMembersLoaded(true);
+    } catch (error) {
+      console.error("Failed to load project members:", error);
+      setProjectMembers([]);
+    }
+  }, [project?.id, membersLoaded, projectApi, isAuth]);
+
+  const loadPublicTasks = useCallback(async () => {
+    if (isAuth || !workspaceSlug || !projectSlug) return;
+
+    try {
+      setIsLoadingPublic(true);
+      setLocalError(null);
+
+      const filters = {
+        limit: pageSize,
+        page: currentPage,
+      };
+
+      const publicTaskResponse = await getPublicProjectTasks(
+        workspaceSlug as string,
+        projectSlug as string,
+        filters
+      );
+
+      setPublicTasks(publicTaskResponse.data || []);
+      setPublicTasksTotal(publicTaskResponse.total || 0);
+    } catch (error) {
+      console.error("Failed to load public tasks:", error);
+      setLocalError(error instanceof Error ? error.message : "Failed to load public tasks");
+    } finally {
+      setIsLoadingPublic(false);
+      setIsInitialLoad(false);
+    }
+  }, [isAuth, workspaceSlug, projectSlug, pageSize, currentPage, getPublicProjectTasks]);
+
+  const loadTasks = useCallback(async () => {
+    if (!isAuth) return;
+
+    if (!currentOrganizationId || !project?.id) {
+      return;
+    }
+
+    if (!validateRequiredData()) {
+      return;
+    }
+
+    try {
+      setLocalError(null);
+
+      // When no status filter is selected on list view, exclude the last workflow status (completed/done)
+      let statusFilter: { statuses?: string } = {};
+      if (selectedStatuses.length > 0) {
+        statusFilter = { statuses: selectedStatuses.join(",") };
+      } else if (currentView === "list" && availableStatuses.length > 0) {
+        const maxPosition = Math.max(...availableStatuses.map((s) => s.position ?? 0));
+        const activeStatusIds = availableStatuses
+          .filter((s) => s.position !== maxPosition)
+          .map((s) => s.id);
+        if (activeStatusIds.length > 0) {
+          statusFilter = { statuses: activeStatusIds.join(",") };
+        }
+      }
+
+      const params = {
+        projectId: project.id,
+        workspaceId: workspace.id,
+        ...statusFilter,
+        ...(selectedPriorities.length > 0 && {
+          priorities: selectedPriorities.join(","),
+        }),
+        ...(selectedTaskTypes.length > 0 && {
+          types: selectedTaskTypes.join(","),
+        }),
+        ...(selectedAssignees.length > 0 && {
+          assignees: selectedAssignees.join(","),
+        }),
+        ...(selectedReporters.length > 0 && {
+          reporters: selectedReporters.join(","),
+        }),
+        ...(debouncedSearchQuery.trim() && {
+          search: debouncedSearchQuery.trim(),
+        }),
+        sortBy: sortField,
+        sortOrder: sortOrder,
+        page: currentPage,
+        limit: pageSize,
+      };
+      await getAllTasks(currentOrganizationId, params);
+    } catch (error) {
+      console.error("Failed to load tasks:", error);
+      setLocalError(error instanceof Error ? error.message : "Failed to load tasks");
+    } finally {
+      setIsInitialLoad(false);
+    }
+  }, [
+    isAuth,
+    currentOrganizationId,
+    workspace?.id,
+    project?.id,
+    currentPage,
+    pageSize,
+    selectedAssignees,
+    selectedReporters,
+    debouncedSearchQuery,
+    selectedStatuses,
+    selectedPriorities,
+    selectedTaskTypes,
+    availableStatuses,
+    currentView,
+    validateRequiredData,
+    getAllTasks,
+    sortField,
+    sortOrder,
+  ]);
+
+  useEffect(() => {
+    if (currentView === "gantt") {
+      if (project && projectSlug) {
+        if (isAuth) {
+          loadGanttData();
+        }
+      }
+      return;
+    }
+    if (currentView === "list") {
+      if (isAuth && currentOrganizationId && project?.id) {
+        loadTasks();
+      } else if (!isAuth) {
+        loadPublicTasks();
+      }
+    }
+    if (currentView === "kanban" && project && projectSlug && isAuth) {
+      loadKanbanData(projectSlug as string);
+    }
+  }, [
+    currentView,
+    currentOrganizationId,
+    project?.id,
+    projectSlug,
+    isAuth,
+    selectedAssignees,
+    selectedReporters,
+  ]);
+
+  const loadKanbanData = useCallback(
+    async (projSlug: string, statusId?: string, page: number = 1) => {
+      if (!isAuth) return;
+
+      try {
+        const response = await getTaskKanbanStatus({
+          slug: projSlug,
+          includeSubtasks: true,
+          ...(statusId && { statusId, page }),
+        });
+
+        if (page === 1 || !statusId) {
+          setKanban(response.data || []);
+          setIsInitialLoad(false);
+        } else {
+          setKanban((prevKanban) => {
+            return prevKanban.map((status) => {
+              if (status.statusId === statusId) {
+                const newStatusData = response.data.find((s) => s.statusId === statusId);
+                if (newStatusData) {
+                  return {
+                    ...status,
+                    tasks: [...status.tasks, ...newStatusData.tasks],
+                    pagination: newStatusData.pagination,
+                  };
+                }
+              }
+              return status;
+            });
+          });
+        }
+      } catch (error) {
+        console.error("Failed to load kanban data:", error);
+        setKanban([]);
+        setIsInitialLoad(false);
+      }
+    },
+    [getTaskKanbanStatus, isAuth]
+  );
+  const handleLoadMoreKanbanTasks = useCallback(
+    async (statusId: string, page: number) => {
+      await loadKanbanData(projectSlug as string, statusId, page);
+    },
+    [loadKanbanData, projectSlug]
+  );
+  const loadGanttData = useCallback(async () => {
+    if (!currentOrganizationId || !project?.id || !isAuth) return;
+    try {
+      await getCalendarTask(currentOrganizationId, {
+        projectId: project.id,
+        workspaceId: workspace.id,
+        includeSubtasks: true,
+      });
+      setIsInitialLoad(false);
+    } catch (error) {
+      console.error("Failed to load Gantt data:", error);
+      setIsInitialLoad(false);
+    }
+  }, [currentOrganizationId, workspace?.id, project?.id, isAuth]);
+
+  const handleTaskUpdate = useCallback(
+    async (taskId: string, updates: any) => {
+      try {
+        await updateTask(taskId, updates);
+        // Refresh Gantt data if needed, or rely on optimistic update in context
+        if (isAuth) {
+          loadGanttData();
+        }
+      } catch (error) {
+        console.error("Failed to update task:", error);
+      }
+    },
+    [updateTask, isAuth, loadGanttData]
+  );
+
+  useEffect(() => {
+    if (!router.isReady) return;
+
+    const currentRoute = `${workspaceSlug}/${projectSlug}`;
+    if (routeRef.current !== currentRoute) {
+      routeRef.current = currentRoute;
+      loadInitialData();
+    }
+  }, [router.isReady, workspaceSlug, projectSlug]);
+
+  useEffect(() => {
+    if (isAuth) {
+      // For list view, wait for statuses to load so we can exclude the last workflow status
+      if (currentOrganizationId && project?.id && (currentView !== "list" || statusesLoaded)) {
+        loadTasks();
+      }
+    } else {
+      loadPublicTasks();
+    }
+  }, [currentOrganizationId, project?.id, isAuth, statusesLoaded, currentView]);
+
+  useEffect(() => {
+    if (project?.id && isAuth) {
+      loadStatusData();
+      loadProjectMembers();
+    }
+  }, [project?.id, isAuth]);
+
+  const previousFiltersRef = useRef({
+    page: currentPage,
+    pageSize,
+    search: debouncedSearchQuery,
+    statuses: selectedStatuses.join(","),
+    priorities: selectedPriorities.join(","),
+    types: selectedTaskTypes.join(","),
+    sortField,
+    sortOrder,
+  });
+
+  useEffect(() => {
+    if (!isAuth) return;
+    if (!currentOrganizationId || !project?.id) return;
+
+    const currentFilters = {
+      page: currentPage,
+      pageSize,
+      search: debouncedSearchQuery,
+      statuses: selectedStatuses.join(","),
+      priorities: selectedPriorities.join(","),
+      types: selectedTaskTypes.join(","),
+      sortField,
+      sortOrder,
+    };
+
+    const filtersChanged =
+      JSON.stringify(currentFilters) !== JSON.stringify(previousFiltersRef.current);
+    previousFiltersRef.current = currentFilters;
+
+    if (firstRenderRef.current) {
+      firstRenderRef.current = false;
+      return;
+    }
+
+    if (filtersChanged && validateRequiredData()) {
+      loadTasks();
+    }
+  }, [
+    isAuth,
+    currentOrganizationId,
+    project?.id,
+    currentPage,
+    pageSize,
+    debouncedSearchQuery,
+    selectedStatuses,
+    selectedPriorities,
+    selectedTaskTypes,
+    sortField,
+    sortOrder,
+  ]);
+
+  useEffect(() => {
+    if (!isAuth && project) {
+      loadPublicTasks();
+    }
+  }, [currentPage, pageSize, isAuth, project]);
+
+  const displayTasks = isAuth ? tasks : publicTasks;
+  const displayLoading = isAuth ? isLoading : isLoadingPublic;
+
+  // Tasks are already sorted by the backend, so we use displayTasks directly
+  const sortedTasks = displayTasks;
+
+  const handleExport = useCallback((format: "csv" | "pdf" | "xlsx" | "json" = "csv") => {
+    if (format === "csv") {
+      exportTasksToCSV(sortedTasks, columns, `project-tasks-${projectSlug}.csv`);
+    } else if (format === "xlsx") {
+      exportTasksToXLSX(sortedTasks, columns, `project-tasks-${projectSlug}.xlsx`);
+    } else if (format === "json") {
+      exportTasksToJSON(sortedTasks, columns, `project-tasks-${projectSlug}.json`);
+    } else {
+      exportTasksToPDF(sortedTasks, columns, `project-tasks-${projectSlug}.pdf`);
+    }
+  }, [columns, sortedTasks, projectSlug]);
+
+  const statusFilters = useMemo(
+    () =>
+      isAuth
+        ? availableStatuses.map((status) => ({
+          id: status.id,
+          label: status.name,
+          value: status.id,
+          selected: selectedStatuses.includes(status.id),
+          count: status._count?.tasks || 0,
+          color: status.color || "#6b7280",
+        }))
+        : [],
+    [availableStatuses, selectedStatuses, isAuth]
+  );
+
+  const priorityFilters = useMemo(
+    () =>
+      isAuth
+        ? availablePriorities.map((priority) => {
+            const serverCount = taskResponse?.filterCounts?.priorities?.find(
+              (p) => p.value === priority.value
+            );
+            return {
+              id: priority.id,
+              name: priority.name,
+              value: priority.value,
+              selected: selectedPriorities.includes(priority.value),
+              count: serverCount?.count || 0,
+              color: priority.color,
+            };
+          })
+        : [],
+    [availablePriorities, selectedPriorities, taskResponse?.filterCounts?.priorities, isAuth]
+  );
+
+  const taskTypeFilters = useMemo(
+    () =>
+      isAuth
+        ? availableTaskTypes.map((type) => {
+          const typeKey = type as keyof typeof TaskTypeIcon;
+          const iconData = TaskTypeIcon[typeKey];
+          const serverCount = taskResponse?.filterCounts?.types?.find(
+            (t) => t.value === type
+          );
+          return {
+            id: type,
+            name: type.charAt(0) + type.slice(1).toLowerCase(),
+            value: type,
+            selected: selectedTaskTypes.includes(type),
+            count: serverCount?.count || 0,
+            color: iconData?.color || "text-gray-500",
+          };
+        })
+        : [],
+    [availableTaskTypes, selectedTaskTypes, taskResponse?.filterCounts?.types, isAuth]
+  );
+
+  const assigneeFilters = useMemo(() => {
+    return projectMembers.map((member) => {
+      const serverCount = taskResponse?.filterCounts?.assignees?.find(
+        (a) => a.id === member.user.id
+      );
+      return {
+        id: member.user.id,
+        name: member?.user?.firstName + " " + member.user.lastName,
+        value: member?.user.id,
+        selected: selectedAssignees.includes(member.user.id),
+        count: serverCount?.count || 0,
+        email: member?.user?.email,
+      };
+    });
+  }, [projectMembers, selectedAssignees, taskResponse?.filterCounts?.assignees]);
+
+  const reporterFilters = useMemo(() => {
+    return projectMembers.map((member) => {
+      const serverCount = taskResponse?.filterCounts?.reporters?.find(
+        (r) => r.id === member.user.id
+      );
+      return {
+        id: member.user.id,
+        name: member?.user?.firstName + " " + member.user.lastName,
+        value: member?.user.id,
+        selected: selectedReporters.includes(member.user.id),
+        count: serverCount?.count || 0,
+        email: member?.user?.email,
+      };
+    });
+  }, [projectMembers, selectedReporters, taskResponse?.filterCounts?.reporters]);
+
+  const safeToggleStatus = useCallback(
+    (id: string) => {
+      if (!isAuth) return;
+
+      try {
+        setSelectedStatuses((prev) => {
+          const newSelection = prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id];
+
+          const params = new URLSearchParams(window.location.search);
+          if (newSelection.length > 0) {
+            params.set("statuses", newSelection.join(","));
+          } else {
+            params.delete("statuses");
+          }
+          const newUrl = `${window.location.pathname}?${params.toString()}`;
+          window.history.replaceState({}, "", newUrl);
+          return newSelection;
+        });
+        setCurrentPage(1);
+      } catch (error) {
+        console.error("Error toggling status filter:", error);
+      }
+    },
+    [isAuth]
+  );
+
+  const safeTogglePriority = useCallback(
+    (id: string) => {
+      if (!isAuth) return;
+
+      try {
+        setSelectedPriorities((prev) => {
+          const newSelection = prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id];
+
+          const params = new URLSearchParams(window.location.search);
+          if (newSelection.length > 0) {
+            params.set("priorities", newSelection.join(","));
+          } else {
+            params.delete("priorities");
+          }
+          const newUrl = `${window.location.pathname}?${params.toString()}`;
+          window.history.replaceState({}, "", newUrl);
+          return newSelection;
+        });
+        setCurrentPage(1);
+      } catch (error) {
+        console.error("Error toggling priority filter:", error);
+      }
+    },
+    [isAuth]
+  );
+
+  const safeToggleTaskType = useCallback(
+    (id: string) => {
+      if (!isAuth) return;
+
+      try {
+        setSelectedTaskTypes((prev) => {
+          const newSelection = prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id];
+
+          const params = new URLSearchParams(window.location.search);
+          if (newSelection.length > 0) {
+            params.set("types", newSelection.join(","));
+          } else {
+            params.delete("types");
+          }
+          const newUrl = `${window.location.pathname}?${params.toString()}`;
+          window.history.replaceState({}, "", newUrl);
+          return newSelection;
+        });
+        setCurrentPage(1);
+      } catch (error) {
+        console.error("Error toggling task type filter:", error);
+      }
+    },
+    [isAuth]
+  );
+
+  const toggleAssignee = useCallback((id: string) => {
+    setSelectedAssignees((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+    setCurrentPage(1);
+  }, []);
+
+  const toggleReporter = useCallback((id: string) => {
+    setSelectedReporters((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+    setCurrentPage(1);
+  }, []);
+
+  const filterSections = useMemo(
+    () =>
+      isAuth
+        ? [
+          createSection({
+            id: "status",
+            title: t("filters.status"),
+            icon: CheckSquare,
+            data: statusFilters,
+            selectedIds: selectedStatuses,
+            searchable: false,
+            onToggle: safeToggleStatus,
+            onSelectAll: () => setSelectedStatuses(statusFilters.map((s) => s.id)),
+            onClearAll: () => setSelectedStatuses([]),
+          }),
+          createSection({
+            id: "priority",
+            title: t("filters.priority"),
+            icon: Flame,
+            data: priorityFilters,
+            selectedIds: selectedPriorities,
+            searchable: false,
+            onToggle: safeTogglePriority,
+            onSelectAll: () => setSelectedPriorities(priorityFilters.map((p) => p.id)),
+            onClearAll: () => setSelectedPriorities([]),
+          }),
+          createSection({
+            id: "type",
+            title: t("filters.type"),
+            icon: Shapes,
+            data: taskTypeFilters,
+            selectedIds: selectedTaskTypes,
+            searchable: false,
+            onToggle: safeToggleTaskType,
+            onSelectAll: () => setSelectedTaskTypes(taskTypeFilters.map((t) => t.id)),
+            onClearAll: () => setSelectedTaskTypes([]),
+          }),
+          createSection({
+            id: "assignee",
+            title: t("filters.assignee"),
+            icon: User,
+            data: assigneeFilters,
+            selectedIds: selectedAssignees,
+            searchable: true,
+            onToggle: toggleAssignee,
+            onSelectAll: () => setSelectedAssignees(assigneeFilters.map((a) => a.id)),
+            onClearAll: () => setSelectedAssignees([]),
+          }),
+          createSection({
+            id: "reporter",
+            title: t("filters.reporter"),
+            icon: Users,
+            data: reporterFilters,
+            selectedIds: selectedReporters,
+            searchable: true,
+            onToggle: toggleReporter,
+            onSelectAll: () => setSelectedReporters(reporterFilters.map((r) => r.id)),
+            onClearAll: () => setSelectedReporters([]),
+          }),
+        ]
+        : [],
+    [
+      isAuth,
+      statusFilters,
+      priorityFilters,
+      taskTypeFilters,
+      selectedStatuses,
+      selectedPriorities,
+      selectedTaskTypes,
+      assigneeFilters,
+      selectedAssignees,
+      selectedReporters,
+      reporterFilters,
+      toggleAssignee,
+      toggleReporter,
+      safeToggleStatus,
+      safeTogglePriority,
+      safeToggleTaskType,
+      createSection,
+      t,
+    ]
+  );
+
+  const totalActiveFilters = isAuth
+    ? selectedStatuses.length +
+    selectedPriorities.length +
+    selectedTaskTypes.length +
+    selectedAssignees.length +
+    selectedReporters.length
+    : 0;
+
+  const clearAllFilters = useCallback(() => {
+    if (!isAuth) return;
+
+    setSelectedStatuses([]);
+    setSelectedPriorities([]);
+    setSelectedTaskTypes([]);
+    setSelectedAssignees([]);
+    setSelectedReporters([]);
+    setCurrentPage(1);
+
+    const params = new URLSearchParams(window.location.search);
+    params.delete("statuses");
+    params.delete("priorities");
+    params.delete("types");
+    const newUrl = `${window.location.pathname}?${params.toString()}`;
+    window.history.replaceState({}, "", newUrl);
+  }, [isAuth]);
+
+  const handleAddColumn = (columnId: string) => {
+    const columnConfigs: Record<string, { label: string; type: ColumnConfig["type"] }> = {
+      description: { label: t("columns.description"), type: "text" },
+      taskNumber: { label: t("columns.taskNumber"), type: "number" },
+      timeline: { label: t("columns.timeline"), type: "dateRange" },
+      completedAt: { label: t("columns.completedAt"), type: "date" },
+      storyPoints: { label: t("columns.storyPoints"), type: "number" },
+      originalEstimate: { label: t("columns.originalEstimate"), type: "number" },
+      remainingEstimate: { label: t("columns.remainingEstimate"), type: "number" },
+      reporter: { label: t("columns.reporter"), type: "user" },
+      updatedBy: { label: t("columns.updatedBy"), type: "user" },
+      createdAt: { label: t("columns.createdAt"), type: "date" },
+      updatedAt: { label: t("columns.updatedAt"), type: "date" },
+      sprint: { label: t("columns.sprint"), type: "text" },
+      parentTask: { label: t("columns.parentTask"), type: "text" },
+      childTasksCount: { label: t("columns.childTasksCount"), type: "number" },
+      commentsCount: { label: t("columns.commentsCount"), type: "number" },
+      attachmentsCount: { label: t("columns.attachmentsCount"), type: "number" },
+      timeEntries: { label: t("columns.timeEntries"), type: "number" },
+    };
+
+    const config = columnConfigs[columnId];
+    if (!config) {
+      console.warn(`Unknown column ID: ${columnId}`);
+      return;
+    }
+
+    const newColumn: ColumnConfig = {
+      id: columnId,
+      label: config.label,
+      type: config.type,
+      visible: true,
+    };
+
+    setColumns((prev) => [...prev, newColumn]);
+  };
+
+  const handleRemoveColumn = (columnId: string) => {
+    setColumns((prev) => prev.filter((col) => col.id !== columnId));
+  };
+
+  const handleTaskCreated = useCallback(async () => {
+    if (!isAuth) return;
+
+    try {
+      await loadTasks();
+
+      if (currentView === "kanban") {
+        const data = await getTaskKanbanStatus({
+          slug: projectSlug as string,
+          includeSubtasks: true,
+          page: kanbanPage,
+          limit: kanbanLimit,
+        });
+        setKanban(data.data || []);
+      }
+    } catch (error) {
+      console.error("Error refreshing tasks:", error);
+      throw error;
+    }
+  }, [isAuth, loadTasks, currentView, projectSlug, getTaskKanbanStatus]);
+
+  const handleTaskRefetch = useCallback(async () => {
+    if (isAuth) {
+      await loadTasks();
+    } else {
+      await loadPublicTasks();
+    }
+  }, [isAuth, loadTasks, loadPublicTasks]);
+
+  const handleRetry = useCallback(() => {
+    setLocalError(null);
+    loadInitialData();
+    if (isAuth && currentOrganizationId && project?.id) {
+      loadTasks();
+    } else if (!isAuth) {
+      loadPublicTasks();
+    }
+  }, [loadInitialData, isAuth, currentOrganizationId, project?.id, loadTasks, loadPublicTasks]);
+
+  const handlePageChange = useCallback((page: number) => {
+    setCurrentPage(page);
+  }, []);
+
+  const handlePageSizeChange = useCallback((size: number) => {
+    setPageSize(size);
+    setCurrentPage(1);
+  }, []);
+
+  const clearSearch = useCallback(() => {
+    setSearchInput("");
+  }, []);
+
+  const renderContent = () => {
+    if (isInitialLoad || displayLoading) {
+      return currentView === "kanban" ? <KanbanColumnSkeleton /> : <TaskTableSkeleton />;
+    }
+
+    if (!displayTasks.length) {
+      return (
+        <EmptyState
+          searchQuery={debouncedSearchQuery}
+          priorityFilter={selectedPriorities.length > 0 ? "filtered" : "all"}
+        />
+      );
+    }
+
+    switch (currentView) {
+      case "kanban":
+        if (!isAuth) {
+          return (
+            <div className="text-center py-12">
+              <p className="text-[var(--muted-foreground)]">
+                {t("kanbanAuthRestriction")}
+              </p>
+            </div>
+          );
+        }
+        if (!kanban.length) {
+          return currentView === "kanban" ? <KanbanColumnSkeleton /> : <TaskTableSkeleton />;
+        }
+        return kanban.length ? (
+          <KanbanBoard
+            kanbanData={kanban}
+            projectId={project?.id || ""}
+            onRefresh={() => loadKanbanData(projectSlug as string)}
+            onLoadMore={handleLoadMoreKanbanTasks}
+            kabBanSettingModal={kabBanSettingModal}
+            setKabBanSettingModal={setKabBanSettingModal}
+            workspaceSlug={workspaceSlug as string}
+            projectSlug={projectSlug as string}
+            onKanbanUpdate={setKanban}
+          />
+        ) : (
+          <div className="text-center py-12">
+            <p className="text-[var(--muted-foreground)]">
+              {t("noWorkflow")}
+            </p>
+          </div>
+        );
+      case "gantt":
+        if (!isAuth) {
+          return (
+            <div className="text-center py-12">
+              <p className="text-[var(--muted-foreground)]">
+                {t("ganttAuthRestriction")}
+              </p>
+            </div>
+          );
+        }
+        return (
+          <TaskGanttView
+            tasks={displayTasks}
+            workspaceSlug={workspaceSlug as string}
+            projectSlug={projectSlug as string}
+            viewMode={ganttViewMode}
+            onViewModeChange={setGanttViewMode}
+            onTaskUpdate={handleTaskUpdate}
+          />
+        );
+      default:
+        return (
+          <TaskListView
+            tasks={sortedTasks}
+            workspaceSlug={workspaceSlug as string}
+            projectSlug={projectSlug as string}
+            onTaskRefetch={handleTaskRefetch}
+            columns={columns}
+            addTaskStatuses={availableStatuses}
+            addTaskPriorities={addTaskPriorities}
+            projectMembers={projectMembers}
+            showAddTaskRow={hasAccess && isAuth}
+            onTaskSelect={handleTaskSelect}
+            onTasksSelect={handleTasksSelect}
+            selectedTasks={selectedTasks}
+            showBulkActionBar={
+              hasAccess || userAccess?.role === "OWNER" || userAccess?.role === "MANAGER"
+            }
+            totalTask={pagination.totalCount}
+          />
+        );
+    }
+  };
+
+  const showPagination =
+    currentView !== "kanban" && displayTasks.length > 0 && pagination.totalPages > 1;
+
+  const { setShow404, show404 } = useLayout();
+
+  useEffect(() => {
+    if (error && !show404) {
+      const is404Error =
+        error.toLowerCase().includes("not found") ||
+        error.toLowerCase().includes("404") ||
+        error.toLowerCase().includes("project not found") ||
+        error.toLowerCase().includes("workspace not found") ||
+        error.toLowerCase().includes("not a member of this scope") ||
+        error.toLowerCase().includes("forbidden") ||
+        error.toLowerCase().includes("403") ||
+        error.toLowerCase().includes("unauthorized");
+
+      if (is404Error) {
+        setShow404(true);
+      }
+    }
+  }, [error, setShow404, show404]);
+
+  if (error) {
+    const is404Error =
+      error.toLowerCase().includes("not found") ||
+      error.toLowerCase().includes("404") ||
+      error.toLowerCase().includes("project not found") ||
+      error.toLowerCase().includes("workspace not found") ||
+      error.toLowerCase().includes("not a member of this scope") ||
+      error.toLowerCase().includes("forbidden") ||
+      error.toLowerCase().includes("403") ||
+      error.toLowerCase().includes("unauthorized");
+
+    if (is404Error) {
+      return <NotFound />;
+    }
+    return <ErrorState error={error} onRetry={handleRetry} />;
+  }
+
+  return (
+    <div className="dashboard-container flex flex-col">
+      {/* Unified Sticky Header */}
+      <div className="sticky top-0 z-40 bg-[var(--background)]/95 backdrop-blur supports-[backdrop-filter]:bg-[var(--background)]/80 border-b border-[var(--border)]/10 -mx-4 px-4 pb-0 pt-4">
+        {/* PageHeader */}
+        <div className="pb-2">
+          <PageHeader
+            title={project ? t("projectTasks", { name: project.name }) : t("defaultProjectTasks")}
+            description={project ? t("projectTasksDescription", { name: project.name }) : t("defaultProjectTasksDescription")}
+            actions={
+              <div className="flex flex-col sm:flex-row sm:items-center sm:gap-3 gap-2">
+                <div className="flex items-center gap-2">
+                  {/* Hide search for unauthenticated users */}
+                  {isAuth && (
+                    <div className="relative w-full sm:max-w-xs">
+                      <HiSearch className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--muted-foreground)]" />
+                      <Input
+                        type="text"
+                        placeholder={t("searchPlaceholder")}
+                        value={searchInput}
+                        onChange={(e) => setSearchInput(e.target.value)}
+                        className="pl-10 rounded-md border border-[var(--border)]"
+                      />
+                      {searchInput && (
+                        <button
+                          onClick={clearSearch}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-[var(--muted-foreground)] hover:text-[var(--foreground)] cursor-pointer"
+                        >
+                          <HiXMark size={16} />
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Hide filters for unauthenticated users */}
+                  {isAuth && currentView === "list" && (
+                    <FilterDropdown
+                      sections={filterSections}
+                      title={t("advancedFilters")}
+                      activeFiltersCount={totalActiveFilters}
+                      onClearAllFilters={clearAllFilters}
+                      placeholder={t("filterResults")}
+                      dropdownWidth="w-56"
+                      showApplyButton={false}
+                    />
+                  )}
+                </div>
+
+                {/* ONLY Create Task requires authentication */}
+                {hasAccess && isAuth && (
+                  <ActionButton
+                    primary
+                    showPlusIcon
+                    onClick={() => {
+                      checkAuthForAction(() => {
+                        const safeWorkspaceSlug = sanitizeSlug(workspaceSlug);
+                        const safeProjectSlug = sanitizeSlug(projectSlug);
+                        if (!safeWorkspaceSlug || !safeProjectSlug) {
+                          console.error('Invalid workspace or project slug');
+                          router.push('/');
+                          return;
+                        }
+                        const path = `/${safeWorkspaceSlug}/${safeProjectSlug}/tasks/new`;
+                        if (isValidInternalPath(path)) {
+                          router.push(path);
+                        } else {
+                          router.push('/');
+                        }
+                      });
+                    }}
+                    disabled={!workspace?.id || !project?.id}
+                  >
+                    {t("createTask")}
+                  </ActionButton>
+                )}
+                <NewTaskModal
+                  isOpen={isNewTaskModalOpen}
+                  onClose={() => {
+                    setNewTaskModalOpen(false);
+                    setLocalError(null);
+                  }}
+                  onTaskCreated={async () => {
+                    try {
+                      await handleTaskCreated();
+                    } catch (error) {
+                      const errorMessage = error?.message ? error.message : "Failed to refresh tasks";
+                      console.error("Error creating task:", errorMessage);
+                      if (isAuth) {
+                        await loadTasks();
+                      }
+                    }
+                  }}
+                  workspaceSlug={workspaceSlug as string}
+                  projectSlug={projectSlug as string}
+                />
+                <CsvImportModal
+                  isOpen={isCsvImportOpen}
+                  onClose={() => setCsvImportOpen(false)}
+                  onImportComplete={loadTasks}
+                  workspaceId={workspace?.id}
+                  workspaceName={workspace?.name}
+                  projectId={project?.id}
+                  projectName={project?.name}
+                  projectSlug={projectSlug as string}
+                />
+              </div>
+            }
+          />
+        </div>
+
+        {/* TabView - Limited for unauthenticated users */}
+        <div className="py-3 border-t border-[var(--border)]/50">
+          <TabView
+            currentView={currentView}
+            onViewChange={(v) => {
+              // For unauthenticated users, only allow list view
+              if (!isAuth && v !== "list") {
+                return;
+              }
+              setCurrentView(v);
+              const safeWorkspaceSlug = sanitizeSlug(workspaceSlug);
+              const safeProjectSlug = sanitizeSlug(projectSlug);
+              if (!safeWorkspaceSlug || !safeProjectSlug) {
+                console.error('Invalid workspace or project slug');
+                router.push('/');
+                return;
+              }
+              const path = `/${safeWorkspaceSlug}/${safeProjectSlug}/tasks?type=${v}`;
+              if (isValidInternalPath(path.split('?')[0])) {
+                router.push(path, undefined, {
+                  shallow: true,
+                });
+              } else {
+                router.push('/');
+              }
+            }}
+            viewKanban={isAuth}
+            viewGantt={isAuth}
+            rightContent={
+              <>
+                {/* Hide most controls for unauthenticated users */}
+                {isAuth && currentView === "gantt" && (
+                  <div className="flex items-center bg-[var(--odd-row)] rounded-lg p-1 shadow-sm">
+                    {(["days", "weeks", "months"] as const).map((mode) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setGanttViewMode(mode)}
+                        className={`px-3 py-1 text-sm font-medium rounded-md transition-colors capitalize cursor-pointer ${ganttViewMode === mode
+                          ? "bg-blue-500 text-white"
+                          : "text-slate-600 dark:text-slate-400 hover:bg-[var(--accent)]/50"
+                          }`}
+                      >
+                        {t(`views.${mode}`)}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {/* List view controls - Available for all users */}
+                {currentView === "list" && (
+                  <div className="flex items-center gap-2">
+                    <SortingManager
+                      sortField={sortField}
+                      sortOrder={sortOrder}
+                      onSortFieldChange={setSortField}
+                      onSortOrderChange={setSortOrder}
+                    />
+                    <ColumnManager
+                      currentView={currentView}
+                      availableColumns={columns}
+                      onAddColumn={handleAddColumn}
+                      onRemoveColumn={handleRemoveColumn}
+                      setKabBanSettingModal={setKabBanSettingModal}
+                    />
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <ActionButton
+                          leftIcon={<Download className="w-4 h-4" />}
+                          variant="outline"
+                        >
+                          {t("export")}
+                        </ActionButton>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="bg-[var(--popover)] border-[var(--border)]">
+                        <DropdownMenuItem onClick={() => handleExport("csv")}>
+                          Export as CSV
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => handleExport("xlsx")}>
+                          Export as Excel (.xlsx)
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => handleExport("json")}>
+                          Export as JSON
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => handleExport("pdf")}>
+                          Export as PDF
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+
+                    <ActionButton
+                      leftIcon={<Upload className="w-4 h-4" />}
+                      variant="outline"
+                      onClick={() => setCsvImportOpen(true)}
+                    >
+                      Import
+                    </ActionButton>
+                  </div>
+                )}
+                {/* Kanban view controls - Only for authenticated users */}
+                {isAuth &&
+                  currentView === "kanban" &&
+                  (hasAccess || userAccess?.role === "OWNER" || userAccess?.role === "MANAGER") && (
+                    <div className="flex items-center gap-2">
+                      <Tooltip content={t("manageColumns")} position="top" color="primary">
+                        <ColumnManager
+                          currentView={currentView}
+                          availableColumns={columns}
+                          onAddColumn={handleAddColumn}
+                          onRemoveColumn={handleRemoveColumn}
+                          setKabBanSettingModal={setKabBanSettingModal}
+                        />
+                      </Tooltip>
+                    </div>
+                  )}
+              </>
+            }
+          />
+        </div>
+      </div>
+
+      {/* Scrollable content */}
+      <div className="rounded-md">{renderContent()}</div>
+
+      {/* Natural Flow Pagination */}
+      {showPagination && (
+        <div className="mt-4 border-t border-[var(--border)]/50 py-4 -mx-4 px-4">
+          <Pagination
+            pagination={pagination}
+            pageSize={pageSize}
+            onPageSizeChange={handlePageSizeChange}
+            onPageChange={handlePageChange}
+            itemType="tasks"
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function ProjectTasksPage() {
+  return <ProjectTasksContent />;
+}

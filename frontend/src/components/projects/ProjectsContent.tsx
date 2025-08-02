@@ -1,0 +1,847 @@
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { formatDateForDisplay } from "@/utils/date";
+import { useWorkspaceContext } from "@/contexts/workspace-context";
+import { useProjectContext } from "@/contexts/project-context";
+import { useAuth } from "@/contexts/auth-context";
+import ProjectAvatar from "@/components/ui/avatars/ProjectAvatar";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/common/PageHeader";
+import { EntityCard } from "@/components/common/EntityCard";
+import ActionButton from "@/components/common/ActionButton";
+import { HiFolder, HiClipboardDocumentList, HiCalendarDays, HiXMark } from "react-icons/hi2";
+import { HiSearch, HiViewBoards } from "react-icons/hi";
+import { DynamicBadge } from "@/components/common/DynamicBadge";
+import { NewProjectModal } from "@/components/projects/NewProjectModal";
+import { availableStatuses, availablePriorities } from "@/utils/data/projectFilters";
+import { FilterDropdown, useGenericFilters } from "@/components/common/FilterDropdown";
+import { CheckSquare, Flame } from "lucide-react";
+import ErrorState from "@/components/common/ErrorState";
+import { EmptyState } from "@/components/ui";
+import { projectApi } from "@/utils/api/projectApi";
+
+import { toast } from "sonner";
+import Tooltip from "../common/ToolTip";
+import { CardsSkeleton } from "../skeletons/CardsSkeleton";
+import { useRouter } from "next/router";
+import { useTranslation } from "react-i18next";
+
+interface ProjectsContentProps {
+  contextType: "workspace" | "organization";
+  contextId: string;
+  workspaceSlug?: string;
+  title: string;
+  description: string;
+  emptyStateTitle: string;
+  emptyStateDescription: string;
+  enablePagination?: boolean;
+  generateProjectLink: (project: any, workspaceSlug?: string) => string;
+}
+
+const formatDate = (dateString: string) => {
+  if (!dateString) return "Unknown";
+  try {
+    return formatDateForDisplay(dateString, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+    });
+  } catch {
+    return "Unknown";
+  }
+};
+
+function useDebounce<T>(value: T, delay: number): T {
+  const [debounced, setDebounced] = useState<T>(value);
+
+  useEffect(() => {
+    const handler = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(handler);
+  }, [value, delay]);
+
+  return debounced;
+}
+
+const ProjectsContent: React.FC<ProjectsContentProps> = ({
+  contextType,
+  contextId,
+  workspaceSlug,
+  title,
+  description,
+  emptyStateTitle,
+  emptyStateDescription,
+  enablePagination = false,
+  generateProjectLink,
+}) => {
+  const { t } = useTranslation("projects");
+  const { isAuthenticated, getUserAccess } = useAuth();
+  const { getWorkspaceBySlug } = useWorkspaceContext();
+  const router = useRouter();
+  const {
+    projects,
+    error,
+    isLoading,
+    getProjectsByWorkspace,
+    getProjectsByOrganization,
+    refreshProjects,
+    clearError,
+  } = useProjectContext();
+
+  const [hasAccess, setHasAccess] = useState(false);
+  const [workspace, setWorkspace] = useState<any>(null);
+  const [searchInput, setSearchInput] = useState("");
+  const [isNewProjectModalOpen, setIsNewProjectModalOpen] = useState(false);
+  const [selectedStatuses, setSelectedStatuses] = useState<string[]>(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const statuses = params.get("statuses");
+      return statuses ? statuses.split(",") : [];
+    }
+    return [];
+  });
+  const [selectedPriorities, setSelectedPriorities] = useState<string[]>(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const priorities = params.get("priorities");
+      return priorities ? priorities.split(",") : [];
+    }
+    return [];
+  });
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize] = useState(12);
+  const [hasMore, setHasMore] = useState(false);
+  const [archivedProjects, setArchivedProjects] = useState<any[]>([]);
+  const [unarchivingId, setUnarchivingId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (router.isReady) {
+      const { statuses, priorities } = router.query;
+      if (statuses) {
+        setSelectedStatuses(Array.isArray(statuses) ? statuses : statuses.split(","));
+      }
+      if (priorities) {
+        setSelectedPriorities(Array.isArray(priorities) ? priorities : priorities.split(","));
+      }
+    }
+  }, [router.isReady, router.query.statuses, router.query.priorities]);
+
+  const [isInitialLoad, setIsInitialLoad] = useState(true);
+  const [isFetching, setIsFetching] = useState(false);
+
+  const isMountedRef = useRef(true);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef<string>("");
+  const currentContextRef = useRef<string>("");
+  const isInitializedRef = useRef(false);
+
+  const debouncedSearchQuery = useDebounce(searchInput, 500);
+
+  const { createSection } = useGenericFilters();
+
+  const showLoader = isInitialLoad || (isFetching && projects.length === 0);
+  const showContent = !showLoader && !error;
+
+  // Project icon component
+  const ProjectLeadingIcon = ({ project }: { project: any }) => {
+    const hasImage = project.avatar || project.image || project.logo || project.icon;
+
+    if (hasImage) {
+      return (
+        <div className="w-10 h-10 rounded-sm overflow-hidden flex-shrink-0 bg-transparent">
+          <ProjectAvatar
+            project={project}
+            size="md"
+            className="w-full h-full object-cover rounded-sm"
+          />
+        </div>
+      );
+    }
+
+    return (
+      <div className="w-10 h-10 rounded-md bg-[var(--primary)] flex items-center justify-center text-[var(--primary-foreground)] font-semibold flex-shrink-0">
+        {project.name.charAt(0).toUpperCase()}
+      </div>
+    );
+  };
+
+  const formatStatus = (status: string) => {
+    switch (status?.toUpperCase()) {
+      case "ACTIVE":
+        return t("status.active");
+      case "PLANNING":
+        return t("status.planning");
+      case "ON_HOLD":
+        return t("status.on_hold");
+      case "COMPLETED":
+        return t("status.completed");
+      default:
+        return t("status.active");
+    }
+  };
+
+  // Filter functions
+  const toggleStatus = useCallback((id: string) => {
+    setSelectedStatuses((prev) => {
+      const newSelection = prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id];
+      const newQuery = { ...router.query };
+      if (newSelection.length > 0) {
+        newQuery.statuses = newSelection.join(",");
+      } else {
+        delete newQuery.statuses;
+      }
+      router.push({ pathname: router.pathname, query: newQuery }, undefined, { shallow: true });
+      return newSelection;
+    });
+  }, [router]);
+
+  const togglePriority = useCallback((id: string) => {
+    setSelectedPriorities((prev) => {
+      const newSelection = prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id];
+      const newQuery = { ...router.query };
+      if (newSelection.length > 0) {
+        newQuery.priorities = newSelection.join(",");
+      } else {
+        delete newQuery.priorities;
+      }
+      router.push({ pathname: router.pathname, query: newQuery }, undefined, { shallow: true });
+      return newSelection;
+    });
+  }, [router]);
+
+  const clearAllFilters = useCallback(() => {
+    setSelectedStatuses([]);
+    setSelectedPriorities([]);
+    setSearchInput("");
+    setCurrentPage(1);
+    const { statuses, priorities, ...restQuery } = router.query;
+    router.push({ pathname: router.pathname, query: restQuery }, undefined, { shallow: true });
+  }, [router]);
+
+  // Filter data preparation - always use context projects
+  const statusFilters = useMemo(
+    () =>
+      availableStatuses.map((status) => ({
+        id: status.id,
+        name: t(`status.${status.value.toLowerCase()}`),
+        value: status.value,
+        selected: selectedStatuses.includes(status.value),
+        count: projects.filter((project) => project.status === status.value).length,
+        color: status.color,
+        icon: status.icon,
+      })),
+    [availableStatuses, selectedStatuses, projects, t]
+  );
+
+  const priorityFilters = useMemo(
+    () =>
+      availablePriorities.map((priority) => ({
+        id: priority.id,
+        name: priority.name,
+        value: priority.value,
+        selected: selectedPriorities.includes(priority.value),
+        count: projects.filter((project) => project.priority === priority.value).length,
+        color: priority.color,
+        icon: priority.icon,
+      })),
+    [availablePriorities, selectedPriorities, projects]
+  );
+
+  const filterSections = useMemo(
+    () => [
+      createSection({
+        id: "status",
+        title: t("status.title", "Status"),
+        icon: CheckSquare,
+        data: statusFilters,
+        selectedIds: selectedStatuses,
+        allowSelectAll: false,
+        searchable: false,
+        multiSelect: true,
+        onToggle: toggleStatus,
+        onSelectAll: () => {
+          const allValues = statusFilters.map((s) => s.value);
+          setSelectedStatuses(allValues);
+          const newQuery = { ...router.query, statuses: allValues.join(",") };
+          router.push({ pathname: router.pathname, query: newQuery }, undefined, { shallow: true });
+        },
+        onClearAll: () => {
+          setSelectedStatuses([]);
+          const newQuery = { ...router.query };
+          delete newQuery.statuses;
+          router.push({ pathname: router.pathname, query: newQuery }, undefined, { shallow: true });
+        },
+      }),
+      createSection({
+        id: "priority",
+        title: t("priority.title"),
+        icon: Flame,
+        data: priorityFilters,
+        selectedIds: selectedPriorities,
+        searchable: false,
+        multiSelect: true,
+        allowSelectAll: false,
+        onToggle: togglePriority,
+        onSelectAll: () => {
+          const allValues = priorityFilters.map((p) => p.value);
+          setSelectedPriorities(allValues);
+          const newQuery = { ...router.query, priorities: allValues.join(",") };
+          router.push({ pathname: router.pathname, query: newQuery }, undefined, { shallow: true });
+        },
+        onClearAll: () => {
+          setSelectedPriorities([]);
+          const newQuery = { ...router.query };
+          delete newQuery.priorities;
+          router.push({ pathname: router.pathname, query: newQuery }, undefined, { shallow: true });
+        },
+      }),
+    ],
+    [
+      statusFilters,
+      priorityFilters,
+      selectedStatuses,
+      selectedPriorities,
+      toggleStatus,
+      togglePriority,
+      t
+    ]
+  );
+
+  // Data fetching function
+  const fetchData = useCallback(
+    async (page: number = 1, resetData: boolean = true) => {
+      const contextKey = `${contextType}/${contextId}`;
+      const requestId = `${contextKey}-${Date.now()}-${Math.random()}`;
+
+      if (!contextId || !isAuthenticated()) {
+        return;
+      }
+
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+
+      abortControllerRef.current = new AbortController();
+      requestIdRef.current = requestId;
+      currentContextRef.current = contextKey;
+
+      if (resetData || page === 1) {
+        setIsFetching(true);
+        if (!isInitializedRef.current) {
+          setIsInitialLoad(true);
+        }
+      }
+
+      try {
+        const filters = {
+          ...(selectedStatuses.length > 0 && {
+            status: selectedStatuses.join(","),
+          }),
+          ...(selectedPriorities.length > 0 && {
+            priority: selectedPriorities.join(","),
+          }),
+          ...(debouncedSearchQuery.trim() && {
+            search: debouncedSearchQuery.trim(),
+          }),
+          page: enablePagination ? page : 1,
+          pageSize: enablePagination ? pageSize : 100,
+        };
+
+        let projectsData: any[] = [];
+
+        if (contextType === "workspace") {
+          // For workspace context, get workspace first if needed
+          if (!workspace) {
+            const workspaceData = await getWorkspaceBySlug(contextId);
+
+            if (requestIdRef.current !== requestId || !isMountedRef.current) {
+              return;
+            }
+
+            if (!workspaceData) {
+              throw new Error("Workspace not found");
+            }
+
+            setWorkspace(workspaceData);
+
+            // Call workspace projects API with filters
+            projectsData = await getProjectsByWorkspace(workspaceData.id, filters);
+          } else {
+            // Call workspace projects API with filters
+            projectsData = await getProjectsByWorkspace(workspace.id, filters);
+          }
+        } else if (contextType === "organization") {
+          projectsData = await getProjectsByOrganization(contextId, filters);
+        }
+
+        if (requestIdRef.current !== requestId || !isMountedRef.current) {
+          return;
+        }
+
+        // Handle pagination
+        if (enablePagination) {
+          setHasMore(projectsData.length === pageSize);
+          setCurrentPage(page);
+        }
+
+        isInitializedRef.current = true;
+      } catch (error: any) {
+        if (requestIdRef.current === requestId && isMountedRef.current) {
+          if (error.status === 403) {
+            toast.error(error?.message || t("messages.load_failed"));
+            router.back();
+            return;
+          }
+          if (error.message?.includes("401") || error.message?.includes("Unauthorized")) {
+            toast.error(t("messages.auth_required"));
+          } else {
+            toast.error(t("messages.load_failed"));
+          }
+        }
+      } finally {
+        if (isMountedRef.current && requestIdRef.current === requestId) {
+          setIsFetching(false);
+          setIsInitialLoad(false);
+        }
+      }
+    },
+    [
+      contextType,
+      contextId,
+      isAuthenticated,
+      selectedStatuses,
+      selectedPriorities,
+      debouncedSearchQuery,
+      enablePagination,
+      pageSize,
+      t
+    ]
+  );
+
+  // Fetch archived projects
+  useEffect(() => {
+    if (!hasAccess) return;
+    if (contextType === "workspace" && workspace?.id) {
+      projectApi.getArchivedProjects({ workspaceId: workspace.id })
+        .then((data) => setArchivedProjects(data || []))
+        .catch(() => { });
+    } else if (contextType === "organization" && contextId) {
+      projectApi.getArchivedProjects({ organizationId: contextId })
+        .then((data) => setArchivedProjects(data || []))
+        .catch(() => { });
+    }
+  }, [workspace?.id, contextId, hasAccess, contextType]);
+
+  // Check user access
+  useEffect(() => {
+    if (contextId) {
+      const accessType = contextType === "workspace" ? "workspace" : "organization";
+      const accessId = contextType === "workspace" && workspace ? workspace.id : contextId;
+
+      if (contextType === "workspace" && !workspace) return;
+
+      getUserAccess({ name: accessType, id: accessId })
+        .then((data) => {
+          setHasAccess(data?.canChange);
+        })
+        .catch((error) => {
+          console.error("Error fetching user access:", error);
+        });
+    }
+  }, [contextId, contextType, workspace]);
+
+  // Single effect for data loading and changes
+  useEffect(() => {
+    const contextKey = `${contextType}/${contextId}`;
+
+    // Handle context changes
+    if (currentContextRef.current !== contextKey) {
+      // Robust check for first actual context load
+      const isInitialContextLoad = currentContextRef.current === "" || currentContextRef.current.endsWith("/undefined");
+      isInitializedRef.current = false;
+      setIsInitialLoad(true);
+      setWorkspace(null);
+
+      // Only reset filters if we are switching from one valid context to another
+      // This preserves filters passed via URL on mount even as workspaceSlug resolves
+      if (!isInitialContextLoad) {
+        setSelectedStatuses([]);
+        setSelectedPriorities([]);
+        setSearchInput("");
+      }
+
+      setCurrentPage(1);
+      currentContextRef.current = contextKey;
+    }
+
+    if (contextId) {
+      const timeoutId = setTimeout(
+        () => {
+          fetchData(1, true);
+        },
+        isInitializedRef.current ? 0 : 50
+      );
+
+      return () => clearTimeout(timeoutId);
+    }
+  }, [contextId, contextType, selectedStatuses, selectedPriorities, debouncedSearchQuery]);
+
+  // Effect for pagination (page changes after initial load)
+  useEffect(() => {
+    if (enablePagination && !isInitialLoad && isInitializedRef.current) {
+      fetchData(currentPage, true);
+    }
+  }, [currentPage]);
+
+  // Cleanup effect
+  useEffect(() => {
+    isMountedRef.current = true;
+
+    return () => {
+      isMountedRef.current = false;
+      isInitializedRef.current = false;
+      currentContextRef.current = "";
+      requestIdRef.current = "";
+
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Event handlers
+  const retryFetch = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
+    clearError();
+    isInitializedRef.current = false;
+    currentContextRef.current = "";
+    requestIdRef.current = "";
+    setIsInitialLoad(true);
+    setWorkspace(null);
+    setCurrentPage(1);
+
+    fetchData(1, true);
+  }, [clearError]);
+
+  const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setSearchInput(e.target.value);
+    setCurrentPage(1);
+  };
+
+  const clearSearch = useCallback(() => {
+    setSearchInput("");
+    setCurrentPage(1);
+  }, []);
+
+  const handleProjectCreated = useCallback(async () => {
+    try {
+      await refreshProjects();
+      await fetchData(1, true);
+      toast.success(t("messages.created_success"));
+    } catch (error) {
+      console.error("Error refreshing projects after creation:", error);
+      toast.error(t("messages.refresh_failed"));
+    }
+  }, [refreshProjects, t]);
+
+  const goToPage = (page: number) => {
+    if (!isFetching && enablePagination && page >= 1) {
+      setCurrentPage(page);
+    }
+  };
+
+  const totalActiveFilters = selectedStatuses.length + selectedPriorities.length;
+
+  if (error) {
+    return <ErrorState error={error} onRetry={retryFetch} />;
+  }
+
+  if (showLoader) {
+    return <CardsSkeleton />;
+  }
+
+  const displayTitle =
+    contextType === "workspace" && workspace ? t("workspace_projects", { name: workspace.name, defaultValue: `${workspace.name} Projects` }) : title;
+
+  return (
+    <div className="dashboard-container">
+      <div className="space-y-6 text-md">
+        <PageHeader
+          icon={<HiViewBoards className="size-20px" />}
+          title={displayTitle}
+          description={description}
+          actions={
+            <>
+              {/* Responsive search/filter row for mobile */}
+              <div className="flex flex-col gap-2 w-full md:flex-row md:items-center md:gap-4">
+                <div className="flex flex-row gap-2 w-full">
+                  <div className="relative flex-1 min-w-0">
+                    <HiSearch className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--muted-foreground)]" />
+                    <Input
+                      type="text"
+                      placeholder={t("search_placeholder")}
+                      value={searchInput}
+                      onChange={handleSearchChange}
+                      className="pl-10 rounded-md border border-[var(--border)]"
+                    />
+                    {searchInput && (
+                      <button
+                        onClick={clearSearch}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-[var(--muted-foreground)] hover:text-[var(--foreground)] cursor-pointer"
+                      >
+                        <HiXMark size={16} />
+                      </button>
+                    )}
+                    {isFetching && searchInput && (
+                      <div className="absolute right-8 top-1/2 -translate-y-1/2">
+                        <div className="animate-spin h-4 w-4 border-2 border-[var(--primary)] border-t-transparent rounded-full" />
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex-shrink-0">
+                    <Tooltip content={t("advanced_filters")} position="top" color="primary">
+                      <FilterDropdown
+                        sections={filterSections}
+                        title={t("advanced_filters")}
+                        activeFiltersCount={totalActiveFilters}
+                        onClearAllFilters={clearAllFilters}
+                        placeholder={t("filter_placeholder")}
+                        dropdownWidth="w-56"
+                        showApplyButton={false}
+                      />
+                    </Tooltip>
+                  </div>
+                </div>
+                {/* Create Project button for mobile (below search/filter row) */}
+                {hasAccess && (
+                  <div className="block md:hidden w-full">
+                    <ActionButton
+                      primary
+                      showPlusIcon
+                      onClick={() => setIsNewProjectModalOpen(true)}
+                      className="w-full"
+                    >
+                      {t("create_project")}
+                    </ActionButton>
+                  </div>
+                )}
+              </div>
+              {/* Create Project button for desktop (inline with search/filter) */}
+              {hasAccess && (
+                <div className="hidden md:block">
+                  <ActionButton primary showPlusIcon onClick={() => setIsNewProjectModalOpen(true)}>
+                    {t("create_project")}
+                  </ActionButton>
+                </div>
+              )}
+            </>
+          }
+        />
+
+        <NewProjectModal
+          isOpen={isNewProjectModalOpen}
+          onClose={() => setIsNewProjectModalOpen(false)}
+          workspaceSlug={contextType === "workspace" ? workspaceSlug : undefined}
+          onProjectCreated={handleProjectCreated}
+          initialData={contextType === "organization" ? { organizationId: contextId } : undefined}
+        />
+
+        {/* Content Area */}
+        {showContent && (
+          <>
+            {/* Projects Grid */}
+            {projects.length === 0 ? (
+              searchInput || totalActiveFilters > 0 ? (
+                <EmptyState
+                  icon={<HiSearch size={24} />}
+                  title={t("no_projects_found")}
+                  description={t("no_projects_match")}
+                  action={
+                    <ActionButton primary onClick={clearAllFilters}>
+                      {t("clear_filters")}
+                    </ActionButton>
+                  }
+                />
+              ) : (
+                <EmptyState
+                  icon={<HiFolder size={24} />}
+                  title={emptyStateTitle}
+                  description={emptyStateDescription}
+                  action={
+                    hasAccess && (
+                      <ActionButton
+                        primary
+                        showPlusIcon
+                        onClick={() => setIsNewProjectModalOpen(true)}
+                      >
+                        {t("create_project")}
+                      </ActionButton>
+                    )
+                  }
+                />
+              )
+            ) : (
+              <>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 pb-6">
+                  {projects.map((project) => {
+                    const statusText = formatStatus(project.status);
+
+                    return (
+                      <EntityCard
+                        key={project.id}
+                        href={generateProjectLink(project, workspaceSlug)}
+                        leading={
+                          <div className="w-10 h-10 flex items-center justify-center text-[var(--primary-foreground)] font-semibold">
+                            <ProjectLeadingIcon project={project} />
+                          </div>
+                        }
+                        heading={project.name}
+                        subheading={project.key || project.slug}
+                        description={project.description}
+                        footer={
+                          <div className="flex items-center justify-between w-full">
+                            <div className="flex items-center gap-4">
+                              <Tooltip content={t("tasks_count")} position="top" color="primary">
+                                <span className="flex items-center gap-1">
+                                  <HiClipboardDocumentList size={12} />
+                                  {project._count?.tasks || 0}
+                                </span>
+                              </Tooltip>
+                              <Tooltip content={t("start_date")} position="top" color="primary">
+                                <span className="flex items-center gap-1">
+                                  <HiCalendarDays size={12} />
+                                  {formatDate(project.updatedAt)}
+                                </span>
+                              </Tooltip>
+                            </div>
+                            <DynamicBadge label={statusText} size="sm" />
+                          </div>
+                        }
+                      />
+                    );
+                  })}
+                </div>
+
+                {/* Fixed Bottom Bar: Pagination + Counter */}
+                {projects.length > 0 && (
+                  <div className="w-full flex flex-col items-center pb-4 pt-3 bg-[var(--background)] border-t border-[var(--border)]">
+                    {enablePagination && (currentPage > 1 || hasMore) && (
+                      <div className="flex items-center gap-3 mb-2">
+                        <Button
+                          onClick={() => goToPage(currentPage - 1)}
+                          disabled={currentPage <= 1 || isFetching}
+                          variant="outline"
+                          size="sm"
+                          className="border-[var(--border)] bg-[var(--background)] hover:bg-[var(--muted)] transition-all duration-200 disabled:opacity-50"
+                        >
+                          {t("previous", "Previous")}
+                        </Button>
+                        <span className="text-sm text-[var(--muted-foreground)] tabular-nums">
+                          {t("page_info", { page: currentPage, defaultValue: `Page ${currentPage}` })}
+                        </span>
+                        <Button
+                          onClick={() => goToPage(currentPage + 1)}
+                          disabled={!hasMore || isFetching}
+                          variant="outline"
+                          size="sm"
+                          className="border-[var(--border)] bg-[var(--background)] hover:bg-[var(--muted)] transition-all duration-200 disabled:opacity-50"
+                        >
+                          {isFetching ? (
+                            <div className="w-4 h-4 border-2 border-[var(--primary)] border-t-transparent rounded-full animate-spin" />
+                          ) : (
+                            t("next", "Next")
+                          )}
+                        </Button>
+                      </div>
+                    )}
+                    <p className="flex items-center gap-2 text-sm text-[var(--muted-foreground)]">
+                      {isFetching ? (
+                        <div className="w-4 h-4 border-2 border-[var(--primary)] border-t-transparent rounded-full animate-spin" />
+                      ) : (
+                        <>
+                          {t("showing_projects", { count: projects.length })}
+                          {searchInput && t("matching", { query: searchInput })}
+                          {totalActiveFilters > 0 &&
+                            t("with_filters", { count: totalActiveFilters })}
+                        </>
+                      )}
+                    </p>
+                  </div>
+                )}
+              </>
+            )}
+          </>
+        )}
+
+        {/* Archived Projects Section */}
+        {hasAccess && archivedProjects.length > 0 && (
+          <div className="mt-6">
+            <h3 className="text-sm font-medium text-[var(--muted-foreground)] mb-3">
+              {t("archived_projects", "Archived Projects")}
+            </h3>
+            <div className="space-y-3">
+              {archivedProjects.map((project: any) => {
+                const isWorkspaceArchived = project.workspace?.archive === true;
+                return (
+                  <div
+                    key={project.id}
+                    className="flex items-center justify-between p-3 rounded-lg border border-[var(--border)] bg-[var(--muted)]/30"
+                  >
+                    <div>
+                      <p className="font-medium text-sm">{project.name}</p>
+                      <p className="text-xs text-[var(--muted-foreground)]">{project.slug}</p>
+                    </div>
+                    <Tooltip
+                      content={
+                        isWorkspaceArchived
+                          ? t("unarchive_workspace_first", "Unarchive the parent workspace first")
+                          : t("unarchive_project", "Unarchive project")
+                      }
+                      position="top"
+                      color={isWorkspaceArchived ? "danger" : "primary"}
+                    >
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={unarchivingId === project.id || isWorkspaceArchived}
+                        onClick={async () => {
+                          try {
+                            setUnarchivingId(project.id);
+                            const result = await projectApi.unarchiveProject(project.id);
+                            if (result.success) {
+                              setArchivedProjects((prev) =>
+                                prev.filter((p: any) => p.id !== project.id)
+                              );
+                              toast.success(t("unarchive_success", "Project unarchived successfully"));
+                              setCurrentPage(1);
+                              setHasMore(false);
+                              await fetchData(1, true);
+                            }
+                          } catch (err: any) {
+                            toast.error(err?.message || t("unarchive_failed", "Failed to unarchive project"));
+                          } finally {
+                            setUnarchivingId(null);
+                          }
+                        }}
+                      >
+                        {unarchivingId === project.id
+                          ? t("unarchiving", "Unarchiving...")
+                          : t("unarchive", "Unarchive")}
+                      </Button>
+                    </Tooltip>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+
+export default ProjectsContent;

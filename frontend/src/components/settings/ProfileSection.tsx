@@ -1,0 +1,628 @@
+"use client";
+import { useState, useEffect, useRef, useCallback } from "react";
+import ActionButton from "@/components/common/ActionButton";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { HiPencil, HiCamera } from "react-icons/hi2";
+import { useAuth } from "@/contexts/auth-context";
+import { toast } from "sonner";
+import { Button } from "../ui";
+import React from "react";
+import Tooltip from "../common/ToolTip";
+import { useTranslation } from "react-i18next";
+import { useTimezone } from "@/hooks/useTimezone";
+import { detectBrowserTimezone } from "@/utils/date";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import { HiCheck, HiChevronDown } from "react-icons/hi2";
+
+export default function ProfileSection() {
+  const { t } = useTranslation("settings");
+  const [isEditing, setIsEditing] = useState(false);
+  const { getCurrentUser, updateUser, uploadFileToS3, getUserById } = useAuth();
+  const { timezone, detectFromBrowser, isBrowserTimezoneDifferent, handleTimezoneChange } = useTimezone();
+  const [tzPopoverOpen, setTzPopoverOpen] = useState(false);
+  const [tzSearchTerm, setTzSearchTerm] = useState("");
+
+  const TIMEZONES = [
+    "Africa/Abidjan",
+    "Africa/Accra",
+    "Africa/Cairo",
+    "Africa/Casablanca",
+    "Africa/Johannesburg",
+    "Africa/Lagos",
+    "Africa/Nairobi",
+    "America/Anchorage",
+    "America/Argentina/Buenos_Aires",
+    "America/Bogota",
+    "America/Chicago",
+    "America/Denver",
+    "America/Edmonton",
+    "America/Halifax",
+    "America/Lima",
+    "America/Los_Angeles",
+    "America/Mexico_City",
+    "America/New_York",
+    "America/Phoenix",
+    "America/Santiago",
+    "America/Sao_Paulo",
+    "America/St_Johns",
+    "America/Toronto",
+    "America/Vancouver",
+    "Asia/Baghdad",
+    "Asia/Bangkok",
+    "Asia/Beirut",
+    "Asia/Colombo",
+    "Asia/Dhaka",
+    "Asia/Dubai",
+    "Asia/Ho_Chi_Minh",
+    "Asia/Hong_Kong",
+    "Asia/Jakarta",
+    "Asia/Jerusalem",
+    "Asia/Kabul",
+    "Asia/Karachi",
+    "Asia/Kathmandu",
+    "Asia/Kolkata",
+    "Asia/Kuala_Lumpur",
+    "Asia/Kuwait",
+    "Asia/Manila",
+    "Asia/Muscat",
+    "Asia/Riyadh",
+    "Asia/Seoul",
+    "Asia/Shanghai",
+    "Asia/Singapore",
+    "Asia/Taipei",
+    "Asia/Tehran",
+    "Asia/Tokyo",
+    "Asia/Yangon",
+    "Atlantic/Azores",
+    "Atlantic/Reykjavik",
+    "Australia/Adelaide",
+    "Australia/Brisbane",
+    "Australia/Melbourne",
+    "Australia/Perth",
+    "Australia/Sydney",
+    "Europe/Amsterdam",
+    "Europe/Athens",
+    "Europe/Berlin",
+    "Europe/Brussels",
+    "Europe/Bucharest",
+    "Europe/Budapest",
+    "Europe/Copenhagen",
+    "Europe/Dublin",
+    "Europe/Helsinki",
+    "Europe/Istanbul",
+    "Europe/Lisbon",
+    "Europe/London",
+    "Europe/Madrid",
+    "Europe/Moscow",
+    "Europe/Oslo",
+    "Europe/Paris",
+    "Europe/Prague",
+    "Europe/Rome",
+    "Europe/Stockholm",
+    "Europe/Vienna",
+    "Europe/Warsaw",
+    "Europe/Zurich",
+    "Pacific/Auckland",
+    "Pacific/Fiji",
+    "Pacific/Honolulu",
+    "Pacific/Midway",
+    "UTC",
+  ];
+
+  // Update timezone in backend
+  const updateProfileTimezone = async (tz: string) => {
+    if (!currentUser) return;
+    try {
+      await handleTimezoneChange(tz, false);
+      await updateUser(currentUser.id, { timezone: tz });
+      toast.success(`Timezone updated to ${tz}`);
+    } catch {
+      toast.error("Failed to update timezone");
+    }
+  };
+
+  const filteredTimezones = tzSearchTerm
+    ? TIMEZONES.filter((tz) =>
+        tz.toLowerCase().replace(/_/g, " ").includes(tzSearchTerm.toLowerCase())
+      )
+    : TIMEZONES;
+
+  // Store the current user and profile data
+  const [currentUser, setCurrentUser] = useState(null);
+  const fetchingRef = useRef(false);
+  const currentUserRef = useRef<any>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [profileData, setProfileData] = useState({
+    firstName: "",
+    lastName: "",
+    email: "",
+    username: "",
+    mobileNumber: "",
+    bio: "",
+  });
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [uploadingProfilePic, setUploadingProfilePic] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  // Load and synchronize current user
+  useEffect(() => {
+    const user = getCurrentUser();
+    setCurrentUser(user);
+  }, [getCurrentUser]);
+
+  useEffect(() => {
+    const loadProfile = async () => {
+      if (!currentUser) return;
+      if (currentUserRef.current?.id === currentUser.id) return;
+      currentUserRef.current = currentUser;
+      // Fetch latest profile data for this user
+      const profileResult = await getUserById(currentUser.id);
+      setProfileData({
+        firstName: profileResult?.firstName ?? "",
+        lastName: profileResult?.lastName ?? "",
+        email: profileResult?.email ?? "",
+        username: profileResult?.username ?? "",
+        mobileNumber: profileResult?.mobileNumber ?? "",
+        bio: profileResult?.bio ?? "",
+      });
+      // Optionally refresh currentUser reference since avatar may be changed
+      setCurrentUser(profileResult);
+    };
+    loadProfile();
+  }, [currentUser, getUserById]);
+
+  useEffect(() => {
+    return () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+    };
+  }, [previewUrl]);
+
+  const handleUploadButtonClick = () => fileInputRef.current?.click();
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      toast.error(t("profile_section.invalid_image"));
+      e.target.value = "";
+      return;
+    }
+    setSelectedFile(file);
+    setPreviewUrl(URL.createObjectURL(file));
+  };
+
+  const handleProfilePicUpload = useCallback(async () => {
+    if (!selectedFile || !currentUser) return;
+    setUploadingProfilePic(true);
+    try {
+      const uploadResult = await uploadFileToS3(selectedFile, "avatar");
+      const updatedUser = await updateUser(currentUser.id, { avatar: uploadResult.key });
+      toast.success(t("profile_section.pic_updated"));
+      setSelectedFile(null);
+      setPreviewUrl(null);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      // Refresh user's avatar for immediate UI update
+      setCurrentUser(updatedUser);
+    } catch {
+      toast.error(t("profile_section.pic_update_failed"));
+    } finally {
+      setUploadingProfilePic(false);
+    }
+  }, [selectedFile, currentUser, uploadFileToS3, updateUser, t]);
+
+  const handleProfileSubmit = async () => {
+    if (!currentUser || fetchingRef.current) return;
+    fetchingRef.current = true;
+    setLoading(true);
+    try {
+      // Update main profile fields
+      const updatedUser = await updateUser(currentUser.id, {
+        firstName: profileData.firstName,
+        lastName: profileData.lastName,
+        email: profileData.email,
+        mobileNumber: profileData.mobileNumber,
+        bio: profileData.bio,
+      });
+      toast.success(t("profile_section.profile_updated"));
+      setIsEditing(false);
+      // Refresh UI with updated user profile
+      setCurrentUser(updatedUser);
+    } catch {
+      toast.error(t("profile_section.profile_update_failed"));
+    } finally {
+      setLoading(false);
+      fetchingRef.current = false;
+    }
+  };
+
+  const handleCancel = () => {
+    setProfileData({
+      firstName: currentUser?.firstName || "",
+      lastName: currentUser?.lastName || "",
+      email: currentUser?.email || "",
+      username: currentUser?.username || "",
+      mobileNumber: currentUser?.mobileNumber || "",
+      bio: currentUser?.bio || "",
+    });
+    setIsEditing(false);
+    setSelectedFile(null);
+    setPreviewUrl(null);
+    setTzSearchTerm("");
+    setTzPopoverOpen(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  // Resolve avatar src depending on preview, S3, or local
+  let avatarSrc = "";
+  if (previewUrl) {
+    avatarSrc = previewUrl;
+  } else if (currentUser?.avatar) {
+    if (/^https?:\/\//.test(currentUser.avatar)) {
+      avatarSrc = currentUser.avatar; // S3 or external
+    } else {
+      avatarSrc = `${process.env.NEXT_PUBLIC_API_BASE_URL}/uploads/${currentUser.avatar}`; // Local
+    }
+  }
+  return (
+    <div className="pt-5">
+      {/* Header */}
+      {!isEditing && (
+        <div className="flex flex-row-reverse items-start">
+          <Tooltip content={t("profile_section.edit_profile")} position="top" color="dark">
+            <Button
+              onClick={() => setIsEditing(true)}
+              className="p-2 rounded-md hover:bg-[var(--accent)] transition-colors ml-auto shadow-none"
+            >
+              <HiPencil className="w-4 h-4 text-[var(--primary)]" />
+            </Button>
+          </Tooltip>
+        </div>
+      )}
+
+      {/* Content */}
+      <div className="flex gap-8">
+        <div className="flex flex-col items-center space-y-4 min-w-[200px]">
+          {/* Avatar */}
+          <div className="relative group">
+            <Avatar className="h-24 w-24 border-2 border-[var(--border)]">
+              {avatarSrc && (
+                <AvatarImage
+                  src={avatarSrc}
+                  alt={
+                    `${profileData.firstName} ${profileData.lastName}`.trim() ||
+                    t("profile_section.update_pic")
+                  }
+                  className="object-cover"
+                />
+              )}
+              <AvatarFallback className="bg-[var(--primary)] text-[var(--primary-foreground)] font-medium text-lg">
+                {`${profileData.firstName?.charAt(0) || ""}${profileData.lastName?.charAt(0) || ""}`.toUpperCase()}
+              </AvatarFallback>
+            </Avatar>
+
+            {/* Avatar overlay on hover */}
+            {isEditing && (
+              <div
+                className="absolute inset-0 bg-black/50 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+                onClick={handleUploadButtonClick}
+              >
+                <HiCamera className="w-6 h-6 text-white" />
+              </div>
+            )}
+          </div>
+
+          {/* Username */}
+          <div className="text-center">
+            <p className="text-sm text-[var(--muted-foreground)]">
+              @{profileData.username || t("profile_section.username").toLowerCase()}
+            </p>
+          </div>
+
+          {/* Upload/Save Button - Only in edit mode */}
+          {isEditing && (
+            <div className="">
+              <input
+                type="file"
+                accept="image/*"
+                className="hidden"
+                ref={fileInputRef}
+                onChange={handleFileChange}
+              />
+              {selectedFile ? (
+                <ActionButton
+                  type="button"
+                  secondary
+                  onClick={handleProfilePicUpload}
+                  disabled={uploadingProfilePic}
+                  className="text-sm w-full"
+                >
+                  {uploadingProfilePic ? (
+                    <div className="flex items-center gap-2">
+                      <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                      {t("profile_section.uploading")}
+                    </div>
+                  ) : (
+                    t("profile_section.update_pic")
+                  )}
+                </ActionButton>
+              ) : (
+                <ActionButton
+                  type="button"
+                  secondary
+                  onClick={handleUploadButtonClick}
+                  disabled={uploadingProfilePic}
+                  className="text-sm w-full"
+                >
+                  {t("profile_section.upload_pic")}
+                </ActionButton>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Right Side - Conditional Content */}
+        <div className="flex-1">
+          {isEditing ? (
+            /* Edit Mode - Form Fields */
+            <div className="space-y-4">
+              {/* First Name */}
+              <div className="space-y-2">
+                <Label className="text-sm font-medium text-[var(--foreground)]">
+                  {t("profile_section.first_name")} <span className="text-red-500">*</span>
+                </Label>
+                <Input
+                  type="text"
+                  value={profileData.firstName}
+                  onChange={(e) =>
+                    setProfileData((prev) => ({
+                      ...prev,
+                      firstName: e.target.value,
+                    }))
+                  }
+                  className="bg-[var(--background)] border-[var(--border)] text-xs"
+                  placeholder={t("profile_section.first_name")}
+                />
+              </div>
+
+              {/* Last Name */}
+              <div className="space-y-2">
+                <Label className="text-sm font-medium text-[var(--foreground)]">
+                  {t("profile_section.last_name")} <span className="text-red-500">*</span>
+                </Label>
+                <Input
+                  type="text"
+                  value={profileData.lastName}
+                  onChange={(e) =>
+                    setProfileData((prev) => ({
+                      ...prev,
+                      lastName: e.target.value,
+                    }))
+                  }
+                  className="bg-[var(--background)] border-[var(--border)] text-xs"
+                  placeholder={t("profile_section.last_name")}
+                />
+              </div>
+
+              {/* Email */}
+              <div className="space-y-2">
+                <Label className="text-sm font-medium text-[var(--foreground)]">
+                  {t("profile_section.email")} <span className="text-red-500">*</span>
+                </Label>
+                <Input
+                  type="email"
+                  value={profileData.email}
+                  onChange={(e) =>
+                    setProfileData((prev) => ({
+                      ...prev,
+                      email: e.target.value,
+                    }))
+                  }
+                  className="bg-[var(--background)] border-[var(--border)] text-xs"
+                  placeholder={t("profile_section.email")}
+                />
+                <p className="text-xs text-[var(--muted-foreground)]">
+                  We'll send a verification email if the address is changed.
+                </p>
+              </div>
+
+              {/* Mobile Number */}
+              <div className="space-y-2">
+                <Label className="text-sm font-medium text-[var(--foreground)]">
+                  {t("profile_section.mobile")}
+                </Label>
+                <Input
+                  type="tel"
+                  value={profileData.mobileNumber}
+                  onChange={(e) =>
+                    setProfileData((prev) => ({
+                      ...prev,
+                      mobileNumber: e.target.value,
+                    }))
+                  }
+                  className="bg-[var(--background)] border-[var(--border)] text-xs"
+                  placeholder={t("profile_section.mobile")}
+                />
+              </div>
+
+              {/* Bio */}
+              <div className="space-y-2">
+                <Label className="text-sm font-medium text-[var(--foreground)]">
+                  {t("profile_section.bio")}
+                </Label>
+                <textarea
+                  value={profileData.bio}
+                  onChange={(e) => setProfileData((prev) => ({ ...prev, bio: e.target.value }))}
+                  rows={3}
+                  className="w-full px-3 py-2 text-xs rounded-md resize-none bg-[var(--background)] border border-[var(--border)] focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
+                  placeholder={t("profile_section.bio_placeholder")}
+                />
+              </div>
+
+              {/* Timezone */}
+              <div className="space-y-2">
+                <Label className="text-sm font-medium text-[var(--foreground)]">
+                  {t("profile_section.timezone", "Timezone")}
+                </Label>
+                <div className="flex gap-2 items-center">
+                  <Popover open={tzPopoverOpen} onOpenChange={setTzPopoverOpen}>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="outline"
+                        role="combobox"
+                        aria-expanded={tzPopoverOpen}
+                        className="h-8 justify-between bg-[var(--background)] border-[var(--border)] text-xs font-mono flex-1"
+                      >
+                        <span className="truncate">{timezone || "UTC"}</span>
+                        <HiChevronDown className="w-3 h-3 ml-1 shrink-0 text-[var(--muted-foreground)]" />
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent className="p-0 bg-[var(--card)] border-[var(--border)] shadow-sm w-[340px]">
+                      <Command>
+                        <CommandInput
+                          placeholder="Search timezone..."
+                          value={tzSearchTerm}
+                          onValueChange={setTzSearchTerm}
+                          className="border-b border-[var(--border)] focus:ring-0"
+                        />
+                        <CommandList>
+                          <CommandEmpty>No timezone found.</CommandEmpty>
+                          <CommandGroup className="max-h-[260px] overflow-y-auto">
+                            {filteredTimezones.map((tz) => (
+                              <CommandItem
+                                key={tz}
+                                value={tz}
+                                onSelect={() => {
+                                  updateProfileTimezone(tz);
+                                  setTzPopoverOpen(false);
+                                  setTzSearchTerm("");
+                                }}
+                                className="flex items-center gap-2 cursor-pointer hover:bg-[var(--muted)]"
+                              >
+                                <HiCheck
+                                  className={`w-4 h-4 shrink-0 ${
+                                    timezone === tz ? "opacity-100" : "opacity-0"
+                                  }`}
+                                />
+                                <span className="text-xs font-mono truncate">{tz}</span>
+                              </CommandItem>
+                            ))}
+                          </CommandGroup>
+                        </CommandList>
+                      </Command>
+                    </PopoverContent>
+                  </Popover>
+
+                  {isBrowserTimezoneDifferent() && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      type="button"
+                      onClick={() => {
+                        detectFromBrowser();
+                      }}
+                      className="h-8 text-xs shrink-0"
+                    >
+                      🔄 Detect from browser
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex justify-end gap-3 -mt-2">
+                <ActionButton
+                  type="button"
+                  onClick={handleCancel}
+                  disabled={loading}
+                  className="border border-[var(--border)] bg-transparent hover:bg-[var(--muted)]"
+                >
+                  {t("common.cancel")}
+                </ActionButton>
+                <ActionButton
+                  onClick={handleProfileSubmit}
+                  disabled={
+                    loading ||
+                    !profileData.firstName.trim() ||
+                    !profileData.lastName.trim() ||
+                    !profileData.email.trim() ||
+                    !profileData.username.trim()
+                  }
+                  primary
+                  className="bg-[var(--primary)] hover:bg-[var(--primary)]/90 text-[var(--primary-foreground)]"
+                >
+                  {loading ? (
+                    <div className="flex items-center gap-2">
+                      <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                      {t("profile_section.uploading")}
+                    </div>
+                  ) : (
+                    t("profile_section.save_changes")
+                  )}
+                </ActionButton>
+              </div>
+            </div>
+          ) : (
+            /* Display Mode - User Details as Paragraphs */
+            <div className="space-y-2">
+              <div>
+                <h4 className="text-sm font-medium text-[var(--muted-foreground)]">
+                  {t("profile_section.full_name")}
+                </h4>
+                <p className="text-[var(--foreground)] text-sm">
+                  {`${profileData.firstName} ${profileData.lastName}`.trim() || t("common.no_data")}
+                </p>
+              </div>
+
+              <div>
+                <h4 className="text-sm font-medium text-[var(--muted-foreground)]">
+                  {t("profile_section.email")}
+                </h4>
+                <p className="text-[var(--foreground)] text-sm">
+                  {profileData.email || t("common.no_data")}
+                </p>
+              </div>
+
+              {profileData.mobileNumber && (
+                <div>
+                  <h4 className="text-sm font-medium text-[var(--muted-foreground)]">
+                    {t("profile_section.mobile")}
+                  </h4>
+                  <p className="text-[var(--foreground)] text-sm">{profileData.mobileNumber}</p>
+                </div>
+              )}
+
+              {profileData.bio && (
+                <div>
+                  <h4 className="text-sm font-medium text-[var(--muted-foreground)]">
+                    {t("profile_section.bio")}
+                  </h4>
+                  <p className="text-[var(--foreground)] leading-6 text-sm">{profileData.bio}</p>
+                </div>
+              )}
+
+              {/* Timezone */}
+              <div>
+                <h4 className="text-sm font-medium text-[var(--muted-foreground)]">
+                  {t("profile_section.timezone", "Timezone")}
+                </h4>
+                <p className="text-[var(--foreground)] text-sm font-mono">{timezone || "UTC"}</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
